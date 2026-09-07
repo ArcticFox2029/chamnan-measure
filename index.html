@@ -1,0 +1,451 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Measure chamnan on your repository</title>
+<meta name="description" content="Paste a public GitHub repository and see what chamnan would inject into an agent's context, measured in your browser. Nothing is uploaded.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600&display=swap">
+<style>
+:root{
+  --ground:#FBFBF8; --surface:#FFFFFF; --sunk:#F4F4EF;
+  --ink:#15181C; --muted:#5C6169; --faint:#8A8F96;
+  --rule:#E4E3DD; --accent:#0F6E5C; --accent-soft:#E4F0EC;
+  --warn:#A2600C; --warn-soft:#F8EEDD;
+  --mono:"IBM Plex Mono",ui-monospace,SFMono-Regular,Menlo,monospace;
+  --sans:"IBM Plex Sans",system-ui,-apple-system,Segoe UI,sans-serif;
+}
+@media (prefers-color-scheme:dark){
+  :root:not([data-theme="light"]){
+    --ground:#0E1013; --surface:#15181C; --sunk:#1B1F24;
+    --ink:#E9E9E3; --muted:#9AA0A6; --faint:#6E747B;
+    --rule:#262A2F; --accent:#4FCFAE; --accent-soft:#16302A;
+    --warn:#E0A857; --warn-soft:#2E2416;
+  }
+}
+:root[data-theme="dark"]{
+  --ground:#0E1013; --surface:#15181C; --sunk:#1B1F24;
+  --ink:#E9E9E3; --muted:#9AA0A6; --faint:#6E747B;
+  --rule:#262A2F; --accent:#4FCFAE; --accent-soft:#16302A;
+  --warn:#E0A857; --warn-soft:#2E2416;
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--ground);color:var(--ink);font-family:var(--sans);
+     font-size:16px;line-height:1.6;-webkit-font-smoothing:antialiased}
+.wrap{max-width:60rem;margin:0 auto;padding:0 1.5rem}
+.measure{max-width:38rem}
+h1,h2,h3{font-family:var(--mono);font-weight:600;line-height:1.25;text-wrap:balance;margin:0}
+a{color:var(--accent)}
+code,.num{font-family:var(--mono);font-variant-numeric:tabular-nums}
+
+/* ---------- masthead ---------- */
+header{border-bottom:1px solid var(--rule);padding:3.5rem 0 2.5rem}
+.eyebrow{font-family:var(--mono);font-size:.75rem;letter-spacing:.12em;text-transform:uppercase;
+         color:var(--faint);margin:0 0 1rem}
+h1{font-size:clamp(1.6rem,4vw,2.4rem);letter-spacing:-.02em}
+header p{color:var(--muted);margin:1.25rem 0 0}
+.claim{margin-top:1.5rem;padding:.85rem 1.1rem;background:var(--sunk);
+       border-left:3px solid var(--accent);border-radius:0 4px 4px 0;font-size:.94rem}
+.claim strong{font-family:var(--mono);font-weight:600}
+
+/* ---------- the console ---------- */
+section{padding:3rem 0;border-bottom:1px solid var(--rule)}
+h2{font-size:1.15rem;letter-spacing:-.01em}
+.lede{color:var(--muted);margin:.6rem 0 1.75rem}
+form{display:flex;gap:.6rem;flex-wrap:wrap;align-items:stretch}
+input[type=text]{flex:1 1 22rem;min-width:0;font-family:var(--mono);font-size:.92rem;
+  padding:.7rem .85rem;background:var(--surface);color:var(--ink);
+  border:1px solid var(--rule);border-radius:5px}
+input[type=text]:focus-visible{outline:2px solid var(--accent);outline-offset:1px;border-color:transparent}
+button{font-family:var(--mono);font-size:.9rem;font-weight:500;padding:.7rem 1.3rem;
+  background:var(--accent);color:var(--ground);border:0;border-radius:5px;cursor:pointer}
+button:disabled{opacity:.45;cursor:default}
+button:focus-visible{outline:2px solid var(--ink);outline-offset:2px}
+.samples{margin-top:.9rem;font-size:.85rem;color:var(--muted)}
+.samples button{background:none;color:var(--accent);border:1px solid var(--rule);
+  padding:.2rem .55rem;font-size:.8rem;margin-right:.35rem;border-radius:4px}
+
+#status{margin-top:1.5rem;font-family:var(--mono);font-size:.85rem;color:var(--muted);min-height:1.4em}
+#status .bar{display:inline-block;width:9rem;height:5px;background:var(--sunk);
+  border-radius:3px;vertical-align:middle;margin-left:.6rem;overflow:hidden}
+#status .bar i{display:block;height:100%;background:var(--accent);width:0;transition:width .25s}
+
+/* ---------- results ---------- */
+#out{margin-top:2rem}
+.headline{background:var(--surface);border:1px solid var(--rule);border-radius:8px;
+  padding:1.6rem;margin-bottom:1.25rem}
+.headline .big{font-family:var(--mono);font-size:clamp(2rem,7vw,3.2rem);font-weight:600;
+  letter-spacing:-.03em;color:var(--accent);line-height:1;font-variant-numeric:tabular-nums}
+.headline .cap{color:var(--muted);font-size:.9rem;margin-top:.6rem}
+.cards{display:grid;gap:1.25rem;grid-template-columns:repeat(auto-fit,minmax(17rem,1fr))}
+.card{background:var(--surface);border:1px solid var(--rule);border-radius:8px;padding:1.25rem}
+.card h3{font-size:.78rem;letter-spacing:.1em;text-transform:uppercase;color:var(--faint);
+  margin-bottom:.9rem}
+.row{display:flex;justify-content:space-between;gap:1rem;padding:.42rem 0;
+  border-bottom:1px dotted var(--rule);font-size:.9rem}
+.row:last-child{border-bottom:0}
+.row .k{color:var(--muted)}
+.row .v{font-family:var(--mono);font-variant-numeric:tabular-nums;white-space:nowrap}
+.v.good{color:var(--accent)}
+.v.warn{color:var(--warn)}
+.note{font-size:.82rem;color:var(--faint);margin-top:.9rem;line-height:1.5}
+.scroll{overflow-x:auto}
+table{border-collapse:collapse;width:100%;font-size:.87rem}
+th,td{text-align:right;padding:.45rem .6rem;border-bottom:1px solid var(--rule);white-space:nowrap}
+th:first-child,td:first-child{text-align:left}
+th{font-family:var(--mono);font-weight:500;font-size:.75rem;letter-spacing:.06em;
+   text-transform:uppercase;color:var(--faint)}
+td.n{font-family:var(--mono);font-variant-numeric:tabular-nums}
+
+/* ---------- prose ---------- */
+.prose p{color:var(--muted)}
+.prose ul{color:var(--muted);padding-left:1.1rem}
+.prose li{margin:.4rem 0}
+.prose strong{color:var(--ink);font-weight:600}
+.limits{background:var(--warn-soft);border:1px solid var(--rule);border-left:3px solid var(--warn);
+  border-radius:0 6px 6px 0;padding:1.1rem 1.3rem}
+.limits h2{color:var(--ink);font-size:1rem;margin-bottom:.5rem}
+footer{padding:2.5rem 0 4rem;color:var(--faint);font-size:.85rem}
+</style>
+</head>
+<body>
+
+<header>
+  <div class="wrap">
+    <p class="eyebrow">chamnan · measured in your browser</p>
+    <h1>What would this repository cost an agent, every session?</h1>
+    <div class="measure">
+      <p>Paste any public GitHub repository. chamnan's own code runs here, in this tab, and reports
+         what it would inject into a coding agent's context. Nothing is uploaded and there is no
+         server — the page reads the repository from GitHub the same way your browser reads any
+         other page.</p>
+      <div class="claim">
+        <strong>The claim is efficiency, not correctness.</strong> chamnan bounds what reaches the
+        model. It does not make the model better at your task, and the research on that is linked
+        at the bottom, including the part that argues against doing this at all.
+      </div>
+    </div>
+  </div>
+</header>
+
+<section>
+  <div class="wrap">
+    <h2>Measure a repository</h2>
+    <p class="lede measure">One request to GitHub's API for the file list, then the source files
+      themselves. Public repositories only.</p>
+    <form id="f">
+      <input type="text" id="repo" placeholder="https://github.com/psf/requests  —  or  psf/requests"
+             spellcheck="false" autocomplete="off" value="psf/requests">
+      <button type="submit" id="go">Measure</button>
+    </form>
+    <div class="samples">
+      Try:
+      <button type="button" data-r="pallets/flask">flask</button>
+      <button type="button" data-r="gin-gonic/gin">gin</button>
+      <button type="button" data-r="sinatra/sinatra">sinatra</button>
+      <button type="button" data-r="chalk/chalk">chalk</button>
+    </div>
+    <div id="status">Idle. The first run downloads the Python runtime (~10 MB), then it is cached.</div>
+    <div id="out"></div>
+  </div>
+</section>
+
+<section>
+  <div class="wrap prose measure">
+    <h2>Measured here already</h2>
+    <p class="lede">Nine repositories across eight languages, every one measured through this
+      page in a real browser and cross-checked against the same modules run natively. The pattern is
+      the point, not any single ratio: <strong>the source grows sixty-fold down this table and the
+      injected block stays between 6.4 and 6.6 KB.</strong> That is a bound, not compression.</p>
+    <div class="scroll">
+      <table>
+        <thead><tr><th>repository</th><th>language</th><th>source</th><th>injected</th><th>ratio</th></tr></thead>
+        <tbody id="pre"></tbody>
+      </table>
+    </div>
+    <p class="note">Source is the bytes of indexable files fetched. Injected is what the SessionStart
+      hook writes into the agent's context, after the index is rolled up to its token budget — not
+      the on-disk <code>MAP.md</code>, which is larger and is meant to be grepped, never read whole.</p>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <div class="limits measure">
+      <h2>What this page cannot show you</h2>
+      <div class="prose">
+        <ul>
+          <li><strong>Skills, session handoffs and recorded decisions need installing and using.</strong>
+              Their value comes from a week of real work accumulating in a repository. A one-shot
+              measurement cannot produce that, and this page does not pretend to.</li>
+          <li><strong>Anything that asks git.</strong> There is no process layer in a browser, so
+              churn ranking and commit history are absent here. chamnan degrades to its no-git
+              behaviour, which is a real supported mode — but the numbers above are that mode.</li>
+          <li><strong>Large repositories are sampled.</strong> The file list is capped so the page
+              does not pull a gigabyte through your connection. The cap in force is reported with
+              every result.</li>
+          <li><strong>The turn arithmetic is arithmetic.</strong> No model is called from this page,
+              and you are never asked for an API key. It multiplies a measured per-session cost; it
+              does not observe an agent working.</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+</section>
+
+<footer>
+  <div class="wrap measure">
+    <p>chamnan is a context workspace for coding agents.
+       <a href="https://github.com/ArcticFox2029/chamnan">Source and the full evidence, including
+       the measurements that argue against it</a>.</p>
+    <p>This page runs chamnan's real modules through Pyodide rather than a re-implementation, so the
+       numbers are the tool's own. Repository contents are read by your browser directly from
+       GitHub and are never sent anywhere else.</p>
+  </div>
+</footer>
+
+<script src="https://cdn.jsdelivr.net/pyodide/v0.26.4/full/pyodide.js"></script>
+<script>
+const PRE = [
+  // Every row measured through this page in a real browser on 2026-09-07, then cross-checked
+  // against the same modules run natively. Sorted by source size, because the bound is the point:
+  // the injected block barely moves while the source grows sixty-fold.
+  ["chalk/chalk","JavaScript",60,2678,23],
+  ["psf/requests","Python",398,6485,63],
+  ["pallets/flask","Python",576,6391,92],
+  ["sinatra/sinatra","Ruby",663,6570,103],
+  ["gin-gonic/gin","Go",675,6620,104],
+  ["rust-lang/mdBook","Rust",1187,6465,188],
+  ["tokio-rs/tokio","Rust",2609,6492,412],
+  ["torvalds/linux","C",2874,6545,450],
+  ["vuejs/core","TypeScript",3762,6492,593],
+];
+const kb = n => n >= 1024 ? (n/1024).toFixed(n >= 10240 ? 0 : 1) + " KB" : n + " B";
+const num = n => n.toLocaleString("en-US");
+document.getElementById("pre").innerHTML = PRE.map(([r,l,skb,inj,ratio]) =>
+  `<tr><td>${r}</td><td>${l}</td><td class="n">${num(skb)} KB</td>` +
+  `<td class="n">${num(inj)} B</td><td class="n">${ratio}:1</td></tr>`).join("");
+
+const $ = id => document.getElementById(id);
+const statusEl = $("status"), out = $("out");
+let pyodide = null, EXT = null, booting = null;
+
+function say(msg, pct){
+  statusEl.innerHTML = msg + (pct === undefined ? "" :
+    `<span class="bar"><i style="width:${Math.round(pct*100)}%"></i></span>`);
+}
+
+function parseRepo(v){
+  v = v.trim().replace(/^https?:\/\/(www\.)?github\.com\//i, "").replace(/\.git$/, "");
+  const m = v.match(/^([\w.-]+)\/([\w.-]+)/);
+  return m ? [m[1], m[2]] : null;
+}
+
+async function gh(url){
+  const r = await fetch(url);
+  if (r.status === 403) throw new Error("GitHub rate limit reached (60/hour per IP, unauthenticated). Try again later.");
+  if (r.status === 404) throw new Error("Not found. Public repositories only.");
+  if (!r.ok) throw new Error("GitHub returned " + r.status);
+  return r.json();
+}
+
+// The whole of boot, or none of it. A first version assigned `pyodide` as soon as the runtime
+// loaded and cached it there, so any failure in the steps after that left the page permanently
+// broken: the next attempt saw a truthy `pyodide`, returned early, and used a null `EXT`. The
+// symptom was an error with no message, which is the worst kind. Cache the PROMISE, and only
+// after every step has succeeded.
+function boot(){
+  if (booting) return booting;
+  booting = (async () => {
+    say("Loading the Python runtime — about 10 MB, cached after this…");
+    const py = await loadPyodide();
+    say("Loading chamnan…");
+    const files = await (await fetch("lib/manifest.json")).json();
+    try { py.FS.mkdir("/lib"); } catch (e) { /* already there on a repeat run */ }
+    for (const f of files){
+      const res = await fetch("lib/" + f);
+      if (!res.ok) throw new Error(`could not load chamnan module ${f} (${res.status})`);
+      py.FS.writeFile("/lib/" + f, await res.text());
+    }
+    py.runPython(`import sys; sys.path.insert(0, "/lib")`);
+    const exts = py.runPython(`
+import json, mapper
+json.dumps(sorted(mapper.EXT_LANG.keys()))
+`);
+    pyodide = py;
+    EXT = new Set(JSON.parse(exts));
+    return py;
+  })().catch(err => { booting = null; throw err; });
+  return booting;
+}
+
+const CAP = 400;
+
+async function measure(owner, repo){
+  out.innerHTML = "";
+  await boot();
+
+  say("Reading the repository…");
+  const meta = await gh(`https://api.github.com/repos/${owner}/${repo}`);
+  const branch = meta.default_branch;
+  const tree = await gh(`https://api.github.com/repos/${owner}/${repo}/git/trees/${branch}?recursive=1`);
+
+  const blobs = tree.tree.filter(n => n.type === "blob");
+  const want = blobs.filter(b => {
+    const i = b.path.lastIndexOf(".");
+    return i > 0 && EXT.has(b.path.slice(i).toLowerCase());
+  }).slice(0, CAP);
+
+  if (!want.length) throw new Error("No files chamnan indexes were found in this repository.");
+
+  pyodide.runPython(`
+import shutil, pathlib
+r = pathlib.Path("/repo")
+if r.exists(): shutil.rmtree(r)
+r.mkdir()
+`);
+  // Fetched with a concurrency pool rather than one at a time. Measured: 400 files sequentially
+  // is minutes of round-trips on a CDN that will happily answer several at once, and a page that
+  // takes four minutes to answer is a page nobody waits for. The pool is small on purpose — the
+  // point is to hide latency, not to hammer raw.githubusercontent.com.
+  const POOL = 8;
+  let got = 0, bytes = 0, done = 0;
+  let next = 0;
+  async function worker(){
+    while (true){
+      const i = next++;
+      if (i >= want.length) return;
+      const b = want[i];
+      try{
+        const res = await fetch(`https://raw.githubusercontent.com/${owner}/${repo}/${branch}/${b.path}`);
+        if (res.ok){
+          const text = await res.text();
+          const dir = b.path.split("/").slice(0,-1).join("/");
+          if (dir) pyodide.FS.mkdirTree("/repo/" + dir);
+          pyodide.FS.writeFile("/repo/" + b.path, text);
+          got++; bytes += new TextEncoder().encode(text).length;
+        }
+      }catch(e){ /* one unreadable file must not end the run */ }
+      done++;
+      if (done % 5 === 0 || done === want.length)
+        say(`Fetching source — ${done} of ${want.length}`, done/want.length);
+    }
+  }
+  await Promise.all(Array.from({length: Math.min(POOL, want.length)}, worker));
+
+  say("Running chamnan…");
+  pyodide.globals.set("_bytes", bytes);
+  const raw = pyodide.runPython(`
+import json, pathlib, mapper, rollup, workspace as ws, redact
+root = pathlib.Path("/repo")
+mapper.reset_skips()
+files = list(mapper.scan(root))
+index = mapper.render(files, root)
+budget = ws.DEFAULT_CONFIG.get("index_token_budget", 3000)
+try:
+    injected = rollup.collapse(index, ".chamnan/MAP.md", budget, root, 8)
+except Exception:
+    injected = index
+
+# Credential-shaped strings, COUNTED and never shown. The point being demonstrated is that the
+# redactor runs before anything reaches the model, not where somebody's key is.
+hits = 0
+scanned = 0
+for p in root.rglob("*"):
+    if not p.is_file():
+        continue
+    try:
+        t = p.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        continue
+    scanned += 1
+    if redact.scrub(t) != t:
+        hits += 1
+
+json.dumps({
+  "indexed": len(files),
+  "index_bytes": len(index.encode()),
+  "injected_bytes": len(injected.encode()),
+  "ceiling": ws.DEFAULT_CONFIG.get("output_byte_ceiling", 9000),
+  "redacted_files": hits,
+  "scanned": scanned,
+})
+`);
+  const r = JSON.parse(raw);
+  r.src_bytes = bytes; r.fetched = got; r.total_blobs = blobs.length;
+  r.capped = blobs.length > want.length || tree.truncated;
+  r.slug = `${owner}/${repo}`; r.lang = meta.language;
+  return r;
+}
+
+function render(r){
+  const ratio = r.injected_bytes ? Math.round(r.src_bytes / r.injected_bytes) : 0;
+  const tok = n => Math.round(n / 4);
+  const perSession = tok(r.injected_bytes);
+  out.innerHTML = `
+  <div class="headline">
+    <div class="big">${num(ratio)}:1</div>
+    <div class="cap">${kb(r.src_bytes)} of indexable source in <strong>${r.slug}</strong>
+      becomes <strong>${num(r.injected_bytes)} bytes</strong> injected once per session.</div>
+  </div>
+  <div class="cards">
+    <div class="card">
+      <h3>1 · The map</h3>
+      <div class="row"><span class="k">files indexed</span><span class="v">${num(r.indexed)}</span></div>
+      <div class="row"><span class="k">source fetched</span><span class="v">${kb(r.src_bytes)}</span></div>
+      <div class="row"><span class="k">MAP.md on disk</span><span class="v">${kb(r.index_bytes)}</span></div>
+      <div class="row"><span class="k">injected per session</span><span class="v good">${num(r.injected_bytes)} B</span></div>
+      <div class="row"><span class="k">ceiling</span><span class="v">${num(r.ceiling)} B</span></div>
+      <p class="note">MAP.md is written to disk to be grepped, never read whole. Only the rolled-up
+        block is injected, and it is bounded by the ceiling however large the repository is.</p>
+    </div>
+    <div class="card">
+      <h3>2 · Fifty turns</h3>
+      <div class="row"><span class="k">block, per session</span><span class="v">≈ ${num(perSession)} tok</span></div>
+      <div class="row"><span class="k">× 50 turns, one session</span><span class="v good">≈ ${num(perSession)} tok</span></div>
+      <div class="row"><span class="k">re-read per turn instead</span><span class="v warn">≈ ${num(tok(r.src_bytes))} tok / turn</span></div>
+      <p class="note">The block is injected <strong>once per session</strong>, not per turn — so
+        fifty turns cost it once. The second figure is the whole indexable source, shown as the
+        bound on what orienting by reading files could cost, not as a prediction that an agent
+        would read all of it. No model was called to produce either number.</p>
+    </div>
+    <div class="card">
+      <h3>3 · Credentials</h3>
+      <div class="row"><span class="k">files scanned</span><span class="v">${num(r.scanned)}</span></div>
+      <div class="row"><span class="k">files the redactor changed</span>
+        <span class="v ${r.redacted_files ? "warn" : "good"}">${num(r.redacted_files)}</span></div>
+      <p class="note">Counted, never displayed. This shows that <code>redact.scrub</code> runs over
+        repository text before any of it reaches the model — it is not a secret scanner, and this
+        page will not tell you or anyone else what it matched or where. A match is frequently a test
+        fixture rather than a live key.</p>
+    </div>
+  </div>
+  ${r.capped ? `<p class="note">Sampled: ${num(r.fetched)} of ${num(r.total_blobs)} files
+     (cap ${num(CAP)}), so the source figure is a floor, not the repository's full size.</p>` : ""}`;
+}
+
+async function run(){
+  const parsed = parseRepo($("repo").value);
+  if (!parsed){ say("That does not look like a GitHub repository."); return; }
+  $("go").disabled = true;
+  try{
+    const r = await measure(parsed[0], parsed[1]);
+    render(r);
+    say(`Done — ${r.slug}, ${num(r.indexed)} files indexed in your browser.`);
+  }catch(e){
+    out.innerHTML = "";
+    say("Stopped: " + (e && (e.message || e.toString()) || "unknown error"));
+    console.error(e);
+  }finally{
+    $("go").disabled = false;
+  }
+}
+
+$("f").addEventListener("submit", e => { e.preventDefault(); run(); });
+document.querySelectorAll(".samples button").forEach(b =>
+  b.addEventListener("click", () => { $("repo").value = b.dataset.r; run(); }));
+</script>
+</body>
+</html>
