@@ -216,6 +216,16 @@ def where_git_says_you_stopped(root, limit=6, name_files=True):
     # scoped to this directory, so a workspace in a monorepo subproject gets its own answer rather
     # than an empty section. See that function.
     if not ws.git_can_speak_for(root):
+        # A git old enough to reject `-C` fails the call above, and "not a repository" is the wrong
+        # thing to tell that reader — the two are indistinguishable from a return code, which is
+        # why `git_can_speak_for` records which one it saw. `-C` arrived in git 1.8.5 (2013) and
+        # RHEL 7 and CentOS 7 shipped 1.8.3.1 for years, so this is reachable; and "install git" is
+        # useless advice to somebody who already has it (R13 agent 1).
+        if ws.git_is_too_old():
+            return ("**Where the last session stopped** — not available: the `git` on this machine "
+                    "is too old for `git -C`, which arrived in git 1.8.5 (2013) and is what every "
+                    "query here uses. Upgrading git restores this section; everything else in this "
+                    "block already works without it.")
         # 🐛 [2026-09-06] Without this, a directory holding a `.git` git itself refuses -- an
         # interrupted `git init`, a copied-without-contents `.git` -- made every call below walk up
         # and answer about the nearest REAL repository above it. Reproduced: this section reported
@@ -380,7 +390,7 @@ def carry_forward(root):
                            for title, text in carried)
     if tokens.estimate(body) > MAX_CARRY_TOKENS:
         body = body[:tokens.cut_at(body, MAX_CARRY_TOKENS)].rsplit("\n", 1)[0] + \
-            f"\n\n_…truncated — read `{mdblock.one_line(group[0].name)}` for the rest._"
+            f"\n\n_…truncated — read `{mdblock.as_quoted(group[0].name)}` for the rest._"
     return f"{head}\n\n{body}"
 
 

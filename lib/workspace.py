@@ -1599,8 +1599,27 @@ def safe_tool_name(name):
 # behind by a killed process is broken after LOCK_STALE seconds rather than waited on forever, and
 # failing to acquire is not an error: the caller writes anyway. Losing one increment to a busy lock
 # is a worse hint; refusing to record anything is a worse tool.
+# 🐛 [2026-09-08] LOCK_TIMEOUT used to be a ceiling on TOTAL waiting, and that is the wrong
+# quantity. 8 processes x 50 increments is 400 turns through a lock, and on a platform where one
+# turn costs 5 ms the queue drains in 2 seconds while on one where it costs 200 ms it does not --
+# so the same code kept its promise on POSIX and broke it on Windows, where a waiter gave up and
+# wrote unguarded: 41 of 400 increments recorded, silently, forever. Reproduced on macOS by
+# shrinking the ceiling instead of slowing the disk, which is the same experiment: 389/400 at
+# 0.05 s. The 40x between the two is Windows' per-operation cost, not a flaky runner.
+#
+# So it is a ceiling on waiting WITHOUT PROGRESS now. Every time the lock changes hands the
+# waiter's deadline is reset, because a queue that is moving is one worth staying in. LOCK_WAIT_MAX
+# stops a pathological storm from hanging a session outright.
 LOCK_TIMEOUT = 2.0
+LOCK_WAIT_MAX = 30.0
 LOCK_STALE = 30.0
+
+# Why acquisitions gave up, counted rather than guessed. A lost update reports a NUMBER -- "83 of
+# 400" -- and a number cannot say whether the waiters timed out, hit the absolute ceiling, or fell
+# out of the loop on an exception nobody expected. Windows is the platform where this matters and
+# the one that cannot be debugged interactively from here, so the run has to carry its own
+# diagnosis home. Read by tests/test_concurrent_writers.py; nothing in the shipped path looks at it.
+LOCK_GIVEUPS = {"no_progress": 0, "waited_too_long": 0, "unexpected_error": 0, "taken": 0}
 
 
 def _replace_with_retry(tmp, dest, attempts=12, pause=0.02):
@@ -1836,7 +1855,12 @@ def exclusive(path):
         lock.parent.mkdir(parents=True, exist_ok=True)
     except OSError:
         pass
-    fd, deadline = None, time.time() + LOCK_TIMEOUT
+    fd = None
+    started = time.time()
+    deadline = started + LOCK_TIMEOUT
+    # What the lock looked like last time we were refused. A change in it means somebody finished
+    # and somebody else started -- the queue is moving, and this waiter's turn is coming.
+    seen = None
     while True:
         try:
             fd = os.open(str(lock), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
@@ -1873,7 +1897,18 @@ def exclusive(path):
                     continue
             except OSError:
                 pass
-            if time.time() > deadline:
+            now = time.time()
+            try:
+                st = lock.stat()
+                here = (lock.read_bytes(), st.st_mtime_ns, getattr(st, "st_ino", 0))
+            except OSError:
+                here = None
+            if here != seen:
+                seen = here
+                deadline = now + LOCK_TIMEOUT
+            if now > deadline or now - started > LOCK_WAIT_MAX:
+                LOCK_GIVEUPS["waited_too_long" if now - started > LOCK_WAIT_MAX
+                             else "no_progress"] += 1
                 break
             time.sleep(0.01)
         # 🐛 A lock another process has just unlinked sits in Windows' DELETE-PENDING state for a
@@ -1889,11 +1924,23 @@ def exclusive(path):
         # a lost update on a running total that nothing ever recomputes, so it stays wrong forever.
         # The ubuntu column of the same run raised it zero times, which is why POSIX never saw this.
         except PermissionError:
-            if time.time() > deadline:
+            # DELETE-PENDING is progress by definition: the previous holder is on its way out.
+            now = time.time()
+            deadline = now + LOCK_TIMEOUT
+            if now - started > LOCK_WAIT_MAX:
+                LOCK_GIVEUPS["waited_too_long"] += 1
                 break
             time.sleep(0.01)
-        except OSError:
+        except OSError as exc:
+            # Not FileExistsError and not PermissionError: something this loop has no plan for.
+            # It used to leave silently, which is how a platform-specific failure mode stays
+            # invisible -- record what it was so the next Windows run says so out loud.
+            LOCK_GIVEUPS["unexpected_error"] += 1
+            LOCK_GIVEUPS.setdefault("errors", []).append(
+                f"{type(exc).__name__}:{getattr(exc, 'errno', '?')}")
             break
+    if fd is not None:
+        LOCK_GIVEUPS["taken"] += 1
     try:
         yield fd is not None
     finally:
@@ -2182,6 +2229,21 @@ _GIT_OWNS = {}
 
 
 
+# True when git IS on PATH but cannot answer `-C`. Kept apart from `git_is_installed()` because
+# the two cases need different sentences: "install git" is useless advice to somebody who has it.
+_GIT_TOO_OLD = False
+
+
+def git_is_too_old():
+    """Whether a `git -C` in this process has come back saying it does not know that option.
+
+    False until one has been attempted: this reports evidence already gathered, it does not go
+    looking. `git_can_speak_for` is what sets it, and every caller that needs this answer has been
+    through that function first.
+    """
+    return _GIT_TOO_OLD
+
+
 def git_is_installed():
     """Whether a `git` executable is on PATH at all. Cached, like `git_owns`.
 
@@ -2194,6 +2256,25 @@ def git_is_installed():
     global _GIT_ON_PATH
     if _GIT_ON_PATH is None:
         import shutil
+        # 🐛 [2026-09-07] `which("git")` answers "a file called git exists", and every `git -C` in
+        # this package needs more than that: `-C` arrived in git 1.8.5, and RHEL 7 and CentOS 7
+        # shipped 1.8.3.1 for years. On such a machine this returned True, the diagnostic added
+        # this morning for "git is missing" therefore never fired, and every git-derived section
+        # went silent with nothing anywhere saying why — which is the exact failure that
+        # diagnostic exists to prevent, reached by the other half of the same set (R13 agent 1).
+        #
+        # So the question is not "is git here" but "can git answer the way this package asks", and
+        # the only honest way to know is to ask it once.
+        # \U0001f41b [2026-09-07] This ran `git -C . rev-parse` here to find out whether the git on
+        # PATH is new enough to understand `-C` (1.8.5, 2013). It answered correctly and cost a
+        # process spawn on every session to do it — and `git_can_speak_for` runs `git -C` a moment
+        # later anyway, so the same fact was already available for free from a call we make
+        # regardless. CI showed the cost rather than the correctness: Windows went from 4m16s to
+        # 9m25s and three concurrency checks stopped fitting their window.
+        #
+        # So this is a cheap `which` again, and "too old" is recorded by the first real `git -C`
+        # that comes back saying it does not know the option. Detection where the evidence already
+        # is, rather than a question asked in advance.
         _GIT_ON_PATH = shutil.which("git") is not None
     return _GIT_ON_PATH
 
@@ -2256,6 +2337,12 @@ def git_can_speak_for(root):
         out = _subprocess().run(["git", "-C", str(root), "rev-parse", "--show-toplevel"],
                                 stdin=_subprocess().DEVNULL, capture_output=True, text=True,
                                 encoding="utf-8", errors="replace", timeout=10)
+        # A git too old for `-C` fails on the OPTION, not on the directory — "unknown option"
+        # rather than "not a repository". Recorded here because this is the first `git -C` any
+        # session makes, so the answer costs nothing beyond the call already being made.
+        if out.returncode != 0 and "unknown option" in (out.stderr or "").lower():
+            global _GIT_TOO_OLD
+            _GIT_TOO_OLD = True
         answer = out.returncode == 0 and bool(out.stdout.strip())
         if not answer:
             answer = git_owns(root)          # a bare repository, which has no working tree
@@ -2289,11 +2376,23 @@ def git_owns(root):
         else:
             # No working tree: a bare repository is still "this directory IS the repository", and
             # refusing one here would take the specific bare-repo refusals with it.
+            # `--absolute-git-dir` arrived in git 2.13 (2017), four generations after `-C` itself,
+            # so a git from the 1.8.5-2.12 range — Ubuntu 14.04 and 16.04 shipped one — has the
+            # flag this function is called with and not the flag this branch uses. It answered
+            # False for a bare repository that git itself resolves, silently. `--git-dir` is as old
+            # as git and gives the same answer once resolved against `root` (R13 agent 1).
             bare = _subprocess().run(
                 ["git", "-C", str(root), "rev-parse", "--absolute-git-dir"],
                 capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=10)
+            if bare.returncode != 0 and "unknown option" in (bare.stderr or "").lower():
+                bare = _subprocess().run(
+                    ["git", "-C", str(root), "rev-parse", "--git-dir"],
+                    capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=10)
             if bare.returncode == 0 and bare.stdout.strip():
-                answer = Path(bare.stdout.strip()).resolve() == Path(root).resolve()
+                found = Path(bare.stdout.strip())
+                if not found.is_absolute():          # --git-dir may answer relatively
+                    found = Path(root) / found
+                answer = found.resolve() == Path(root).resolve()
     except git_cannot_answer():  # git missing, unrunnable, or an unresolvable path
         answer = False
     except Exception:                     # noqa: BLE001 — subprocess timeouts and friends
