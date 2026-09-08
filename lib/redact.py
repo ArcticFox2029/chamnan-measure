@@ -97,7 +97,11 @@ PATTERNS = [
     # Provider tokens with unambiguous prefixes — no false positives worth worrying about.
     re.compile(r"(?<![A-Za-z0-9_-])sk-(?:proj-|ant-)?[A-Za-z0-9_-]{16,}"),
     re.compile(r"(?<![A-Za-z0-9_-])(?:gh[pousr]_|github_pat_)[A-Za-z0-9_]{16,}"),
-    re.compile(r"(?<![A-Za-z0-9_-])xox[baprs]-[A-Za-z0-9-]{10,}"),
+    # 🐛 [2026-09-08] `xoxe-` and `xoxe.` are Slack's rotation-era refresh and access
+    # tokens, introduced 2021, and neither matched `xox[baprs]-` -- so a rotated token
+    # leaked in full with the word "token" on the same line (R2 agent 2).
+    re.compile(r"(?<![A-Za-z0-9_-])xox[baprse]-[A-Za-z0-9-]{10,}"),
+    re.compile(r"(?<![A-Za-z0-9_-])xoxe\.xox[bp]-[A-Za-z0-9.-]{10,}"),
     # 🐛 `AKIA` alone. AWS issues access key IDs under four prefixes and the commonest one in CI is
     # `ASIA` — the temporary credential every assumed role hands out — which sailed straight through
     # (R5 agent 2, against gitleaks' and detect-secrets' own fixtures).
@@ -875,7 +879,7 @@ _TEMPLATED = re.compile(r"\{[^{}]*\}")
 # PATTERNS. Splitting a key across an interpolation must not be a way through, so the prefix alone
 # disqualifies the exemption.
 _CREDENTIAL_PREFIX = re.compile(
-    r"(?:^|[^A-Za-z0-9])(?:sk-|pk-|rk_|ak_|phc_|ghp_|gho_|ghs_|ghu_|ghr_|github_pat_|xox[baprs]-|"
+    r"(?:^|[^A-Za-z0-9])(?:sk-|pk-|rk_|ak_|phc_|ghp_|gho_|ghs_|ghu_|ghr_|github_pat_|xox[baprse]-|"
     r"AKIA|ASIA|ABIA|ACCA|AIza|ya29\.|glpat-|dop_v1_|shpat_|SG\.|npm_|dckr_pat_)", re.I)
 _WEAK_SECRET_WORD = re.compile(r"(?:^|[^A-Za-z])keys?\s*$", re.I)
 
@@ -1227,7 +1231,11 @@ _DIGIT_FOLD = str.maketrans({
 # safe to add because a 4-4-4-4 dotted run cannot be an IPv4 address (no octet has four digits) and
 # the Luhn check and brand prefix still both have to pass. NBSP and the narrow/thin spaces come out
 # of spreadsheets and PDFs, where they are what a copy-paste actually produces.
-_SEP = r"[ .\u00a0\u2007\u2009\u202f-]"
+# 🐛 [2026-09-08] The tab was missing, and a tab is what a spreadsheet, a TSV export and a
+# copy out of a terminal table all produce -- so a card number, a Thai national ID or an
+# Aadhaar number pasted from any of them went through whole. One constant, three rules
+# using it, one character (R1 agent 2).
+_SEP = r"[ \t.\u00a0\u2007\u2009\u202f-]"
 # The grouped form: four-digit groups separated by a single separator, or Amex's 4-6-5.
 _CARD_GROUPED = re.compile(
     r"(?<![0-9A-Za-z_-])((?:[0-9]{4}" + _SEP + r"){3}[0-9]{3,4}"
@@ -1316,14 +1324,44 @@ _IBAN_LENGTHS = {
     "SA": 24, "SC": 31, "SD": 18, "SE": 24, "SI": 19, "SK": 24, "SM": 27, "ST": 25, "SV": 28,
     "TL": 23, "TN": 24, "TR": 26, "UA": 29, "VA": 22, "VG": 24, "XK": 20,
 }
-_IBAN = re.compile(r"(?<![A-Za-z0-9])([A-Z]{2}[0-9]{2}(?:" + _SEP + r"?[A-Za-z0-9]){10,30})"
-                   r"(?![A-Za-z0-9])")
+# 🐛 [2026-09-08] This used to read `(?:_SEP?[A-Za-z0-9]){10,30}`, and _SEP contains a space, so
+# the run happily continued through the next English word: `DE89370400440532013000 today` matched
+# with " today" inside it, the length stopped equalling Germany's 22, mod-97 failed, and the rule
+# redacted NOTHING. Six of ten realistic sentences leaked a real IBAN in full -- and the leak needed
+# the commonest shape in prose, a number followed by a word, which is why the module's own
+# false-POSITIVE measurement never met it (R1 agent 2).
+#
+# People write an IBAN two ways and only two: one unbroken run, or groups of four. " today" is five
+# letters after a space and is neither, so both alternatives below refuse it while the printed forms
+# a bank statement actually uses still match.
+_IBAN = re.compile(r"(?i)(?<![A-Za-z0-9])("
+                   r"[A-Z]{2}[0-9]{2}[A-Za-z0-9]{10,30}"                      # one unbroken run
+                   r"|[A-Z]{2}[0-9]{2}(?:" + _SEP + r"[A-Za-z0-9]{4}){2,7}"   # groups of four
+                   r"(?:" + _SEP + r"[A-Za-z0-9]{1,3})?"                      # a short last group
+                   r")(?![A-Za-z0-9])")
+# 🐛 [2026-09-08] `(?i)`, because this was the only rule in the file that was NOT
+# case-insensitive: `de89370400440532013000` leaked in full while the identical number
+# in capitals was redacted. The country code is conventionally upper case and the
+# pattern was written as if that were a rule; it is a convention, and a value pasted
+# out of a database or lower-cased by a logger is neither invalid nor rare. Survived
+# the rewrite this pattern got earlier the same day, which is exactly where a new gap
+# is expected to be (R2 agent 2).
 # Brazil's CPF, in the form people actually write it. The bare 11-digit run is deliberately NOT
 # matched: at 1% it would be tolerable on its own, but 11-digit runs are ordinary in code and the
 # dotted form is what appears in a record somebody pasted.
-_CPF_DOTTED = re.compile(r"(?<![0-9])([0-9]{3}\.[0-9]{3}\.[0-9]{3}-[0-9]{2})(?![0-9])")
+# 🐛 [2026-09-08] The separator was a literal dot, so a CPF written with spaces or hyphens --
+# which is what a spreadsheet export and half the forms in Brazil produce -- leaked whole.
+# `_SEP` is the shared set and this is the FOURTH rule in this file found spelling its own
+# copy of it; the gate above was the third, fixed this morning. The grouping is still
+# required, so the bare 11-digit run stays unmatched for the reason below.
+_CPF_DOTTED = re.compile(r"(?<![0-9])([0-9]{3}" + _SEP + r"[0-9]{3}" + _SEP
+                         + r"[0-9]{3}" + _SEP + r"[0-9]{2})(?![0-9])")
 _AADHAAR = re.compile(r"(?<![0-9])([0-9]{4}" + _SEP + r"?[0-9]{4}" + _SEP + r"?[0-9]{4})(?![0-9])")
-_AADHAAR_WORD = re.compile(r"(?i)(?<![a-z])(aadhaar|aadhar|uidai|\u0906\u0927\u093e\u0930)(?![a-z])")
+# 🐛 [2026-09-08] "UID" was missing -- the acronym UIDAI is named for, and what the number is
+# ordinarily called. The gate exists because Verhoeff passes 9.99% of random 12-digit
+# numbers, so the word beside it is doing the real work and a missing word is a leak.
+_AADHAAR_WORD = re.compile(
+    r"(?i)(?<![a-z])(aadhaar|aadhar|uidai|uid|\u0906\u0927\u093e\u0930)(?![a-z])")
 
 
 def _iban(text):
@@ -1413,7 +1451,13 @@ def _thai_national_id(digits):
 # see the `=>` and YAML-block gates above, and the note there about a gate that tests one character
 # out of a pattern and therefore skips nothing. Measured on this repository's 295 KB index: the
 # personal-data layer costs 34.0 ms unguarded, 11.2% of the whole scrub, and the gate is one scan.
-_A_LONG_DIGIT_RUN = re.compile(r"[0-9][0-9 .\u00a0\u2007\u2009\u202f-]{10,}[0-9]")
+# 🐛 [2026-09-08] This gate spelled the separator set out BY HAND instead of using `_SEP`, and
+# the two drifted the moment one of them gained a character: adding the tab to `_SEP` changed
+# nothing, because a tab-separated card never reached a rule -- the gate above them decided
+# there was no long digit run and returned the text untouched. Two lists that must agree is
+# the defect this file already warns about two hundred lines up, in its own words, about a
+# different pair. Built from `_SEP` now, so there is one list.
+_A_LONG_DIGIT_RUN = re.compile(r"[0-9](?:[0-9]|" + _SEP + r"){10,}[0-9]")
 
 
 def _redact_personal_data(text):
@@ -1446,7 +1490,11 @@ def _redact_personal_data(text):
                       if _thai_national_id(m.group(1))]
         # Not Thai. See the measurement table beside `_iban`: shape is enough for the first two,
         # and Aadhaar needs the word beside it because one in ten random 12-digit numbers passes.
-        spans += [m.span(1) for m in _IBAN.finditer(line) if _iban(m.group(1))]
+        # 🐛 [2026-09-08] `line`, where all six sibling rules read `folded` -- so an IBAN written
+        # in fullwidth or Arabic-Indic digits never matched at all. The fold table was added in
+        # the same commit whose comment calls a rule applied to some members of a set and
+        # forgotten in the identical ones beside it this repository's recurring defect.
+        spans += [m.span(1) for m in _IBAN.finditer(folded) if _iban(m.group(1))]
         spans += [m.span(1) for m in _CPF_DOTTED.finditer(folded) if _cpf(m.group(1))]
         if _AADHAAR_WORD.search(folded):
             spans += [m.span(1) for m in _AADHAAR.finditer(folded) if _aadhaar(m.group(1))]
