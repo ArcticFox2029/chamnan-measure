@@ -516,6 +516,7 @@ const T = {
     becomes: "of indexable source in {repo} becomes {bytes} bytes injected once per session.",
     loadingPy: "Loading the Python runtime — about 10 MB, cached after this…",
     loadingCh: "Loading chamnan…",
+    stillGoing: "— {s}s so far, this is a one-time download",
     reading: "Reading the repository…",
     fetching: "Fetching source — {done} of {total}",
     running: "Running chamnan…",
@@ -609,6 +610,7 @@ const T = {
     becomes: "ของซอร์สที่ index ได้ใน {repo} กลายเป็น {bytes} ไบต์ ที่ใส่เข้าไปครั้งเดียวต่อ session",
     loadingPy: "กำลังโหลด Python runtime — ประมาณ 10 MB หลังจากนี้จะถูก cache…",
     loadingCh: "กำลังโหลด chamnan…",
+    stillGoing: "— ผ่านไป {s} วินาที โหลดครั้งเดียวจบ ครั้งต่อไปไม่ต้องโหลดใหม่",
     reading: "กำลังอ่าน repository…",
     fetching: "กำลังดึงซอร์ส — {done} จาก {total}",
     running: "กำลังรัน chamnan…",
@@ -702,6 +704,7 @@ const T = {
     becomes: "{repo} 中可索引源码 → 每会话注入 {bytes} 字节。",
     loadingPy: "正在加载 Python 运行时——约 10 MB，之后会被缓存…",
     loadingCh: "正在加载 chamnan…",
+    stillGoing: "— 已用 {s} 秒，只需下载这一次",
     reading: "正在读取仓库…",
     fetching: "正在抓取源码 — {done} / {total}",
     running: "正在运行 chamnan…",
@@ -795,6 +798,7 @@ const T = {
     becomes: "{repo} の索引可能なソースが、セッションあたり {bytes} バイトの注入になります。",
     loadingPy: "Python ランタイムを読み込み中——約 10 MB、以降はキャッシュされます…",
     loadingCh: "chamnan を読み込み中…",
+    stillGoing: "— {s} 秒経過。ダウンロードは初回のみです",
     reading: "リポジトリを読み取り中…",
     fetching: "ソースを取得中 — {total} 件中 {done} 件",
     running: "chamnan を実行中…",
@@ -888,6 +892,7 @@ const T = {
     becomes: "de código indexable en {repo} se convierte en {bytes} bytes inyectados una vez por sesión.",
     loadingPy: "Cargando el entorno de Python — unos 10 MB, después queda en caché…",
     loadingCh: "Cargando chamnan…",
+    stillGoing: "— {s}s hasta ahora, es una descarga de una sola vez",
     reading: "Leyendo el repositorio…",
     fetching: "Descargando código — {done} de {total}",
     running: "Ejecutando chamnan…",
@@ -983,8 +988,29 @@ const statusEl = $("status"), out = $("out");
 let pyodide = null, EXT = null, booting = null, CHAMNAN_VERSION = null;
 
 function say(msg, pct){
+  stopTicking();
   statusEl.innerHTML = msg + (pct === undefined ? "" :
     `<span class="bar"><i style="width:${Math.round(pct*100)}%"></i></span>`);
+}
+
+// 🐛 [2026-09-09] The runtime download is about 10 MB and the page said so once, then went silent
+// for as long as it took. On a cold cache that is tens of seconds with a greyed-out button and no
+// other sign of life, which is indistinguishable from a hang — reported as "the page is broken,
+// I cannot measure anything", and it was not broken. A step that can take a minute has to keep
+// saying it is still going.
+let ticker = null;
+function stopTicking(){
+  if (ticker !== null){ clearInterval(ticker); ticker = null; }
+}
+function sayWhileWaiting(key){
+  const started = Date.now();
+  const paint = () => {
+    const secs = Math.round((Date.now() - started) / 1000);
+    statusEl.innerHTML = t(key) + (secs >= 3 ? " " + t("stillGoing", {s: secs}) : "");
+  };
+  say(t(key));
+  paint();
+  ticker = setInterval(paint, 1000);
 }
 
 function parseRepo(v){
@@ -1066,9 +1092,9 @@ function contentUrl(owner, repo, ref, via, path){
 function boot(){
   if (booting) return booting;
   booting = (async () => {
-    say(t("loadingPy"));
+    sayWhileWaiting("loadingPy");
     const py = await loadPyodide();
-    say(t("loadingCh"));
+    say(t("loadingCh"), 0);
     const manifest = await (await fetch("lib/manifest.json")).json();
     const files = manifest.modules || manifest;      // an older bundle was a bare array
     if (manifest.version){
@@ -1077,10 +1103,14 @@ function boot(){
       if (el) el.textContent = t("running", {v: manifest.version});
     }
     try { py.FS.mkdir("/lib"); } catch (e) { /* already there on a repeat run */ }
+    // Fifteen modules, and the count is the honest progress figure here: the page knows exactly
+    // how many there are, so this bar measures something rather than animating.
+    let loaded = 0;
     for (const f of files){
       const res = await fetch("lib/" + f);
       if (!res.ok) throw new Error(`could not load chamnan module ${f} (${res.status})`);
       py.FS.writeFile("/lib/" + f, await res.text());
+      say(t("loadingCh"), ++loaded / files.length);
     }
     py.runPython(`import sys; sys.path.insert(0, "/lib")`);
     const exts = py.runPython(`
@@ -1090,7 +1120,7 @@ json.dumps(sorted(mapper.EXT_LANG.keys()))
     pyodide = py;
     EXT = new Set(JSON.parse(exts));
     return py;
-  })().catch(err => { booting = null; throw err; });
+  })().catch(err => { stopTicking(); booting = null; throw err; });
   return booting;
 }
 
