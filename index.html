@@ -196,7 +196,14 @@ form label{display:block;font-family:var(--mono);font-size:.78rem;letter-spacing
 .headline .big{font-family:var(--mono);font-size:clamp(2rem,7vw,3.2rem);font-weight:600;
   letter-spacing:-.03em;color:var(--accent);line-height:1;font-variant-numeric:tabular-nums}
 .headline .cap{color:var(--muted);font-size:.9rem;margin-top:.6rem}
-.cards{display:grid;gap:1.25rem;grid-template-columns:repeat(auto-fit,minmax(17rem,1fr))}
+/* 🐛 [2026-09-09] The minimum track was 17rem, chosen when this grid sat in a 38rem column
+   and could only ever make one. Widening the page let it make three of 289px, and the
+   simulation table in the middle card needs 304px — so the WITHOUT column was cut off at
+   the card edge and the figure a reader came for was the half that went missing. The track
+   is now wide enough for the widest thing a card holds: measured, that table plus the
+   card's own padding. */
+.cards{display:grid;gap:1.25rem;
+       grid-template-columns:repeat(auto-fit,minmax(min(22rem,100%),1fr))}
 .card{background:var(--surface);border:1px solid var(--rule);border-radius:8px;padding:1.25rem}
 .card h3{font-size:.78rem;letter-spacing:.1em;text-transform:uppercase;color:var(--faint);
   margin-bottom:.9rem}
