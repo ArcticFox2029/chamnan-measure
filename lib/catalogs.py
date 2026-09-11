@@ -77,14 +77,6 @@ def _nested(root):
 # `rel.parts`, which is what made the asymmetry findable. Two harms beyond the missing sections:
 # `mapper.scan` is unaffected, so the index and the catalogues then disagree about the same
 # repository; and the unignored-`.env` warning goes silent, which is the false-calm direction.
-def _rel_parts(path, root):
-    """`path`'s components below `root`, or its own components when it is not below root."""
-    try:
-        return pathlib.Path(path).relative_to(root).parts
-    except (ValueError, TypeError):
-        return pathlib.Path(path).parts
-
-
 def _outside(path, nested):
     return not nested or not any(parent.resolve() in nested for parent in path.parents)
 
@@ -205,7 +197,7 @@ def _grpc(root):
     """(service, method) for every rpc declared in a .proto file."""
     _nest = _nested(root)
     for path in tree.by_suffix(root, ".proto"):
-        if any(q in SKIP_PARTS for q in _rel_parts(path, root)) or not _outside(path, _nest):
+        if any(q in SKIP_PARTS for q in tree.rel_parts(path, root)) or not _outside(path, _nest):
             continue
 # 🐛 [2026-09-08] Every read below took a repository file WHOLE with no size ceiling, on every
 # ordinary `chamnan-map` / `chamnan-context` run, while `mapper` three files away refuses anything
@@ -270,7 +262,7 @@ def _spec_files(root):
     _nest = _nested(root)
     seen = set()
     for path in tree.by_suffix(root, ".yaml", ".yml", ".json"):
-        if path in seen or any(q in SKIP_PARTS for q in _rel_parts(path, root)) \
+        if path in seen or any(q in SKIP_PARTS for q in tree.rel_parts(path, root)) \
                 or not _outside(path, _nest):
             continue
         named = path.stem.lower() in ("openapi", "swagger")
@@ -296,7 +288,7 @@ def _readable(root, patterns):
     seen = set()
     for pat in patterns:
         for path in tree.matching(root, pat):
-            if path in seen or any(p in SKIP_PARTS for p in _rel_parts(path, root)) \
+            if path in seen or any(p in SKIP_PARTS for p in tree.rel_parts(path, root)) \
                     or not _outside(path, _nest) \
                     or not path.is_file() or redact.is_blocked(path):
                 continue
@@ -588,7 +580,7 @@ def _is_ignored(root, path):
     # refuses is not a repository to git, so this call walked UP and let an ANCESTOR's .gitignore
     # decide this repository's answer -- a path ignored there reported ignored here. Falls through
     # to the file walk below rather than answering False, which is the documented degrade path and
-    # the right one when git cannot speak for this directory (R6 acc3, first ten minutes).
+    # the right one when git cannot speak for this directory (R6 acc3, 2026-09-06, first ten minutes).
     try:
         # check-ignore is asked about one specific path, so it is scoped by construction.
         if ws.git_can_speak_for(root):
@@ -611,7 +603,13 @@ def _is_ignored(root, path):
 
 
 def _ignored_by_files(root, path):
+    # Asked once per call rather than once per pattern: `tree.git_folds_case` caches per root, but
+    # the lookup still costs a dict hit inside the pattern loop below.
+    # The QUESTION, not the answer: `glob_matches` only asks it when a case-sensitive match has
+    # already failed and a folded one would succeed, which is the only case where it matters.
+    _fold = lambda: tree.git_folds_case(root)          # noqa: E731
     verdict = False
+    _parent_dir_excluded = False
     chain = []
     d = path.parent
     while True:
@@ -636,9 +634,22 @@ def _ignored_by_files(root, path):
                 continue
             negated = line.startswith("!")
             pat = line[1:] if negated else line
-            pat = pat.rstrip("/")
-            if fnmatch.fnmatch(rel, pat) or fnmatch.fnmatch(path.name, pat):
+            # `tree.gitignore_matches`, not `glob_matches`: git's gitignore glob does not let `*`
+            # cross a `/` and does treat a trailing `/` as "this directory and everything in it".
+            # Matching with `fnmatch` disagreed with real `git check-ignore` in BOTH directions —
+            # `config/*.env` swallowed `config/nested/local.env`, and `secrets/` matched nothing
+            # inside `secrets/`. The trailing slash is handled by the matcher now rather than
+            # rstripped away here, which is what made the second half impossible to get right.
+            if tree.gitignore_matches(rel, pat, _fold() if callable(_fold) else _fold):
+                # git cannot re-include a file whose PARENT DIRECTORY is excluded — its own
+                # documentation says so, and `!build/keep.txt` under `build/` really does stay
+                # ignored. Verified against `git check-ignore` rather than assumed: this was the
+                # one of three disagreements that reads as a bug in git until you look it up.
+                if negated and _parent_dir_excluded:
+                    continue
                 verdict = not negated
+                if not negated and pat.endswith("/"):
+                    _parent_dir_excluded = True
     return verdict
 
 

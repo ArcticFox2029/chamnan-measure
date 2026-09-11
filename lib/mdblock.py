@@ -335,6 +335,7 @@ def cut_outside_a_fence(text, cut):
     if cut >= len(text):
         return len(text)
     at, safe = 0, 0
+    boundaries = []                      # every safe stopping point, newest last
     for line, in_fence in fenced_lines(text):
         nxt = at + len(line) + 1
         if nxt > cut:
@@ -342,7 +343,50 @@ def cut_outside_a_fence(text, cut):
         at = nxt
         if not in_fence:
             safe = at
-    return safe if safe else cut
+            boundaries.append((safe, line))
+    # 🐛 [2026-09-09] A fence is not the only structure a line boundary can cut in half. Found on a
+    # real session handoff: a markdown table delivered as its header row and its `|---|---|` rule
+    # with ZERO data rows under it — a table that promises columns and fills none, which is worse
+    # than either delivering it or never starting it. Backing up past a table that lost all its
+    # data costs the header nobody could use anyway (R7 agent 1).
+    while boundaries and _starts_an_empty_table(boundaries):
+        boundaries.pop()
+        safe = boundaries[-1][0] if boundaries else 0
+        # Backing out of a table that begins the document leaves nothing, and nothing is the honest
+        # answer: a budget that reaches only a header has no room for the table, and half a header
+        # promising columns is what this whole guard exists to prevent. Callers already handle an
+        # empty body — `fit._trim` returns "" and says the section was dropped.
+        if not boundaries:
+            return 0
+    if safe:
+        return safe
+    # No complete line fits at all — the pre-existing fallback, which hands back the raw cut. That
+    # is right for prose (half a sentence still reads) and wrong for a table, where half a header
+    # row is a promise of columns with not even a header to show for it.
+    return 0 if _starts_an_empty_table([(cut, text[:cut])]) else cut
+
+
+def _starts_an_empty_table(boundaries):
+    """Do the lines kept end in a table with no data row under it?
+
+    A markdown table is a header, a `|---|` alignment rule, then rows. Two ways to keep a table
+    that says nothing: the header and the rule with no rows after, or the header alone with the cut
+    landing before even the rule. Both are the same defect and both back up.
+
+    A DATA row is a pipe line that is neither the first of the run nor made only of dashes, colons
+    and pipes. If the trailing run of pipe lines has none, the table is a promise with nothing
+    under it.
+    """
+    run = []
+    for _at, line in reversed(boundaries):
+        if line.lstrip().startswith("|"):
+            run.append(line)
+        else:
+            break
+    if not run:
+        return False
+    run.reverse()
+    return not any(set(l.strip()) - set("|-: ") for l in run[1:])
 
 
 def close_dangling_fence(text):
@@ -383,7 +427,7 @@ _WINDOWS_RESERVED = frozenset(
 
 
 def ascii_stem(source):
-    """The `[a-z0-9-]` reduction all four `slug()` functions do, done once and done accent-safe.
+    """The `[a-z0-9-]` reduction every `slug()` in this package does, done once and accent-safe.
 
     🐛 [2026-09-08] Every `slug()` in this package reduced its title with
     `re.sub(r"[^a-zA-Z0-9]+", "-", title.lower())` on the RAW string, and the same four functions
@@ -417,7 +461,16 @@ def ascii_stem(source):
 def filename_safe(stem):
     """`stem`, or `_stem` when Windows would treat it as a device rather than a file.
 
-    🐛 Both slug() functions in this codebase reduce a title to `[a-z0-9-]` and use it as a filename.
+    🐛 Every store here that reduces a title to `[a-z0-9-]` uses the result as a filename.
+    🐛 [2026-09-10] This sentence and the one on `ascii_stem` above each carried a COUNT of the
+    stores doing this, and both counts were wrong. Three separate call sites carried
+    near-identical comments correcting the number in place rather than fixing it here -- the
+    correction written down three times and applied to the sentence never, which means three
+    people counted and none edited (R2 agent 3, finding 1). Neither sentence carries a number
+    any more: a count is a fact about today wearing the clothes of a rule, and the suite asserts
+    the population directly, which a number never could. The old wording is deliberately not
+    quoted here -- the check that forbids it reads this file.
+
     A thread called "CON" or a candidate sequence "nul" therefore produced `con.md` and `nul.md`,
     which on Windows are the console and the bit-bucket: the write does not fail, it goes to the
     device, and the record is gone. Applied to the stem chamnan chose, never to a name it was given,
@@ -474,17 +527,61 @@ def canonical_title(source):
     return " ".join(unicodedata.normalize("NFC", source).split()).casefold()
 
 
+def distinct_stem(directory_, base, title, title_reader, suffix=".md"):
+    """`base`, or `base` plus a short hash when that name is already taken by a DIFFERENT title.
+
+    `fallback_name` above handles the case where the ASCII reduction empties a title. This handles
+    the one that follows it: two titles that are identical up to the truncation point and differ
+    after it. `slug()` cuts at 40, 50 or 60 characters depending on the store, and on this
+    repository **20 of 22 memory titles already exceed 50** -- so the store has no collisions today
+    by luck rather than by guard (R10 agent 3, findings 2-5).
+
+    Lifted out of `timeline._distinct_slug`, which is the one of four stores that had it. The other
+    three -- decisions/lessons/rules, session records, and workflow candidates -- did not, and the
+    consequence is the second entry silently overwriting the first.
+
+    Two properties matter more than the disambiguation itself, and both come from where the check
+    is made rather than from what it computes:
+
+    - **A pure function cannot know whether a name collides; only the directory can.** An earlier
+      version of this appended a hash whenever slugging *changed* the title, and slugging changes
+      every title with an internal hyphen -- `bge-m3 migration` became `bge-m3-migration-12a9e3`,
+      and the obvious guess at the name matched nothing. Asking the directory keeps every name that
+      does not actually collide readable and guessable.
+    - **An existing file keeps its name.** The first branch returns `base` unchanged when the file
+      is absent OR already holds this same title, so rewriting a record still overwrites itself and
+      a workspace written by an older chamnan is not renamed underneath its owner.
+
+    `title_reader` is the store's own `title_of`, passed in rather than imported, because each
+    store reads a title differently and this must not become a fifth opinion about that.
+    """
+    path = directory_ / f"{base}{suffix}"
+    want = canonical_title(title)
+    if not path.is_file():
+        return base
+    try:
+        if canonical_title(title_reader(path)) == want:
+            return base
+    except OSError:
+        # Unreadable is not "the same title". Disambiguating is the safe direction: a new file
+        # beside an unreadable one loses nothing, while reusing the name could overwrite it.
+        pass
+    import hashlib
+    return f"{base}-{hashlib.sha1(want.encode('utf-8')).hexdigest()[:6]}"
+
+
 def fallback_name(source, kind):
     """A distinct, stable stem for a title the ASCII reduction emptied.
 
-    🐛 [2026-09-06] All four `slug()` functions in this package end `... or "session"` / `"entry"` /
-    `"thread"` / `"candidate"` -- the same latent bug written four times. The reduction keeps
+    🐛 [2026-09-06] Every `slug()` in this package ends `... or "session"` / `"entry"` / `"thread"`
+    / `"candidate"` -- the same latent bug written once per store. (The count that stood here was
+    stale by 2026-09-10, like the two above it; the property is what was ever meant.) The reduction keeps
     `[a-zA-Z0-9]` and nothing else, so EVERY title with no Latin letters in it reduces to the empty
     string and every one of them lands on that single constant name. In a Thai-language repository
     that is not an edge case, it is the normal case: two Thai-titled session records written on one
     day both became `<date>-session.md` and the second overwrote the first, and every Thai memory
     entry ever written collapsed onto one `entry.md`, because memory filenames carry no date to
-    separate them (R6 acc3, hostile filesystem -- reported there as dead code; it is not).
+    separate them (R6 acc3, 2026-09-06, hostile filesystem -- reported there as dead code; it is not).
 
     ASCII-only is kept deliberately, for the reason `sessions.slug` states: these names are read in
     a directory listing and in a git diff. So the fallback stays ASCII and becomes DISTINCT instead

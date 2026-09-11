@@ -45,7 +45,7 @@ CARRIED = ("Remaining", "Blockers")
 # script" — and this cap was the member of that set nobody revisited. Measured with chamnan's own
 # estimator: a Thai carry-forward note costs 1.99x the tokens of an English one at the same
 # character count, so a repository working in Thai was silently spending twice the injection budget
-# this number was chosen to bound (R10 acc3). 500 is what 1,200 characters of English came to, so
+# this number was chosen to bound (R10 acc3, 2026-09-07). 500 is what 1,200 characters of English came to, so
 # the English case is unchanged and only the mis-priced one moves.
 MAX_CARRY_TOKENS = 500
 
@@ -230,7 +230,7 @@ def where_git_says_you_stopped(root, limit=6, name_files=True):
         # interrupted `git init`, a copied-without-contents `.git` -- made every call below walk up
         # and answer about the nearest REAL repository above it. Reproduced: this section reported
         # "10 uncommitted file(s)" and named a branch, for a directory containing one file and no
-        # commits at all; both numbers were the ancestor's (R6 acc3, first ten minutes).
+        # commits at all; both numbers were the ancestor's (R6 acc3, 2026-09-06, first ten minutes).
         return ""
     try:
         # 🐛 [2026-09-06] chamnan's OWN workspace was counted as the user's uncommitted work. git
@@ -279,7 +279,7 @@ def where_git_says_you_stopped(root, limit=6, name_files=True):
     # 🐛 [2026-09-06] A session resumed in the middle of a rebase or a conflicted merge was told it
     # had an ordinary dirty tree -- a file count and a branch name -- and the one fact that changes
     # what the reader should do next was dropped: you are stuck, and the way out is `--continue` or
-    # `--abort` (R6 acc3, unusual repositories). git records the state in its own directory rather
+    # `--abort` (R6 acc3, 2026-09-06, unusual repositories). git records the state in its own directory rather
     # than in `status --porcelain`'s first two columns, so it has to be asked separately. Read from
     # disk, not from another `git` call: this is a section that already costs three subprocesses.
     interrupted = _interrupted_by(root)
@@ -398,10 +398,20 @@ def carry_forward(root):
         #
         # A share each, the way `memory.rules_text` divides its budget between rules, so both
         # arrive shortened rather than one arriving intact and the other not at all. Under the cap
-        # nothing changes — that is the common case and it must not pay for this (R5 agent1).
+        # nothing changes — that is the common case and it must not pay for this (R5 agent1, 2026-09-09).
         parts = re.split(r"(?m)^(?=\*\*)", body)
         parts = [x for x in parts if x.strip()]
         if len(parts) > 1:
+            # EQUAL, not proportional, and that is the design rather than an accident of the
+            # arithmetic. Measured on the one real record: `Remaining` keeps 25.4% of itself and
+            # `Blockers` 35.1%, because the smaller part gets the same raw budget as the larger and
+            # therefore keeps more of what it had. That is the outcome wanted — "a summary that
+            # drops the blocker is worse than one that drops the prose" — and a proportional split
+            # would reverse it, giving the verbose part more room precisely because it is verbose.
+            #
+            # Written down because it was produced as a side effect and named nowhere, which is how
+            # a good property gets "fixed" by somebody tidying an asymmetry they think is a bug
+            # (R7 agent 1).
             share = max(60, MAX_CARRY_TOKENS // len(parts))
             trimmed = []
             for part in parts:
@@ -474,7 +484,19 @@ def prune(root, days):
                     # (2026, 2, 30) and silently returns March 2nd. An impossible date is a typo,
                     # and a typo must not become a deletion decision that looks correct.
                     datetime.date(y, m, dd)
-                    age = time.time() - calendar.timegm((y, m, dd, 12, 0, 0))
+                    _ts = calendar.timegm((y, m, dd, 12, 0, 0))
+                    # 🐛 [2026-09-10] `ledger._ymd_to_ts` refuses a date in the FUTURE and this
+                    # copy — the one that DELETES — never got that half. A record named
+                    # `2099-01-01` gets a negative age, is never doomed, and is therefore always
+                    # the file `keep_the_newest` spares when the pass would take every one: a
+                    # single typo'd filename makes the "always spare one" promise protect the
+                    # wrong file and delete the genuinely newest. A day of slack, so a record
+                    # written in a timezone ahead of this one is not refused for being an hour
+                    # early (R4 agent 3, finding 5). Third copy of this parser, third time this
+                    # exact pair has been half-applied.
+                    if _ts > time.time() + 86400:
+                        raise ValueError("a date in the future is not an age")
+                    age = time.time() - _ts
                 except (ValueError, OverflowError):
                     age = None      # an impossible date is not a date; fall back to mtime
             if age is not None:
@@ -501,12 +523,27 @@ def slug(title):
     # 🐛 `mdblock.filename_safe` exists because a record titled "CON" or "nul" becomes
     # `con.md` or `nul.md`, which on Windows are the console and the bit-bucket: the write
     # does not fail, it goes to the DEVICE, and the record is gone. Its own docstring says
-    # "both slug() functions in this codebase" — there are five, and three never called it
-    # (R2 agent 1 found one; the set walk found the other two).
     s = mdblock.ascii_stem(title)
     return mdblock.filename_safe(s[:40].rstrip("-")
                                  or mdblock.fallback_name(title, "session"))
 
 
 def filename(date, title):
+    """The name a NEW record would take, ignoring what the directory already holds. A writer must
+    use `distinct_filename` — see below."""
     return f"{date}-{slug(title)}.md"
+
+
+def distinct_filename(root, date, title):
+    """`filename(date, title)`, disambiguated against the records already written.
+
+    \U0001f41b [2026-09-09] `slug()` cuts at 40 characters here — the shortest of the four stores —
+    and the date prefix narrows the collision to one day without closing it. Two records written on
+    the same day whose titles agree for 40 characters landed on one file and the second overwrote
+    the first, which is a whole session's handoff gone (R10 agent 3, finding 4).
+
+    The date is part of the base rather than of the suffix, so the disambiguating hash still sorts
+    inside its own day and a directory listing stays chronological.
+    """
+    base = f"{date}-{slug(title)}"
+    return f"{mdblock.distinct_stem(directory(root), base, title, title_of)}.md"

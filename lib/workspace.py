@@ -9,6 +9,7 @@ rebuilding their own — and a machine move carries it along with the clone.
 import re
 import hashlib
 import json
+import secrets
 import time
 import contextlib
 import pathlib
@@ -249,8 +250,18 @@ def workspace(root=None):
 # then `time.time() - (-1) * 86400` puts the cutoff a day in the FUTURE, so every file is "older"
 # than it. Reproduced: a log and a session record written one second earlier, both deleted. Session
 # records are committed work, not cache. One mistyped minus sign.
+# \U0001f41b [2026-09-10] `_in_range` applies the bounds below only to keys in THIS tuple, and
+# `rules_char_budget` was in `_UPPER_BOUND` and not here — so its declared ceiling of 20,000 never
+# ran and `_in_range("rules_char_budget", 500000)` answered True. A bound that is declared and never
+# consulted is the same shape as the environment ceiling fixed the day before: the number is written
+# down, it looks enforced, and nothing checks it (R10 agent 5, finding 5).
+#
+# `state_stale_days` was worse and the report did not name it: in NEITHER tuple, so no bound and no
+# type check at all. Every numeric key a real config carries is in both now, and a check asserts the
+# two sets agree rather than trusting this comment to stay true.
 _NON_NEGATIVE = ("log_retention_days", "session_retention_days", "index_token_budget",
-                 "state_token_budget", "output_byte_ceiling")
+                 "state_token_budget", "output_byte_ceiling", "rules_char_budget",
+                 "state_stale_days")
 
 
 # 🐛 `_in_range` enforced only `>= 0`, so a config that ships WITH a repository could set
@@ -271,6 +282,9 @@ _UPPER_BOUND = {
     "state_token_budget": 100_000,
     "log_retention_days": 3_650,
     "session_retention_days": 3_650,
+    # Ten years, the same as the retention days beside it: a staleness threshold longer than that is
+    # a number somebody typed wrong, not a policy.
+    "state_stale_days": 3_650,
 }
 
 
@@ -278,6 +292,20 @@ _UPPER_BOUND = {
 # RuntimeError and NOT a ValueError — so every `except ValueError` around a `json.loads` here let
 # it through and the SessionStart hook died with zero output. A 20 KB file of 10,000 nested `[`
 # silently killed every session in that repository, and the file arrives with a clone.
+
+
+def upper_bound(key):
+    """The largest value `key` may take, or None when it is unbounded.
+
+    Public because the bound is not only a config concern. `CHAMNAN_OUTPUT_CEILING` sets the same
+    number through a different door and reached `fit.shrink` unbounded -- the config path clamped
+    it to 9,500 and the environment path checked only that it was positive, so `export
+    CHAMNAN_OUTPUT_CEILING=50000` produced a block past the size the host carries whole. The reason
+    for the bound has nothing to do with where the number came from: the host's own cut is around
+    10,000 bytes and is positional, so an over-large ceiling does not deliver more, it delivers a
+    block that stops mid-sentence (R9 agent 3, finding 3).
+    """
+    return _UPPER_BOUND.get(key)
 
 
 def _in_range(key, value):
@@ -367,8 +395,81 @@ def enabled(part, root=None):
 # have deleted the whole feature after seven quiet days — the identical failure the comment
 # below describes being fixed for its two siblings. A log that bounds itself by record must
 # say so here, or the directory sweep bounds it by date instead.
+# 🐛 [2026-09-10] `block_shape.jsonl` and `gate_runs.jsonl` were missing from this tuple, so both
+# were deleted WHOLE after seven quiet days despite bounding themselves by record. They are not
+# ordinary scratch: the first is the only record of what the session block actually delivered — 233
+# firings, and the evidence base for every question about what the block costs — and the second is
+# what lets the release gate say "4,613 checks — was 4,605" instead of a bare number nobody can
+# compare. A week without a session on a repository is not unusual, and neither file announces its
+# own deletion (R4 agent 3, findings 3 and 4).
+#
+# The reason it was missed is worth keeping: `blocklog` declares its path as `"logs/block_shape.jsonl"`
+# — WITH the directory — so a search for a bare `"*.jsonl"` filename literal walks straight past it.
+# `44_...` in the check pool now asserts the population instead of trusting this list to be complete.
+def append_jsonl(root, rel, row, keep):
+    """Append one record to a workspace `.jsonl` and trim it to the newest `keep`. Never raises.
+
+    Lifted out of `blocklog.record` on 2026-09-10 rather than copied beside it: this package's
+    advisory count of function bodies written in more than one file was already at seven, and a
+    second bounded-append would have made it eight in the file whose whole subject is that defect.
+
+    Three properties the callers depend on, and each is here for a recorded reason:
+
+      * **Locked, and it SKIPS rather than waits.** Two sessions starting in the same second is
+        ordinary; a dropped telemetry record is a cheaper outcome than an interleaved file.
+      * **A line that parses but is not an object is discarded.** That is a half-written record,
+        and keeping it hands every reader an AttributeError instead of a number.
+      * **Written atomically**, because a torn last line is exactly what a reader cannot tell from
+        a legitimately different shape.
+
+    Telemetry must never be the thing that breaks a session, so every failure returns False.
+    """
+    try:
+        log = workspace(root) / rel
+        log.parent.mkdir(parents=True, exist_ok=True)
+        with exclusive(log) as held:
+            if not held:
+                return False
+            prior = []
+            if log.is_file():
+                for line in log.read_text(encoding="utf-8-sig", errors="replace").splitlines():
+                    try:
+                        one = json.loads(line)
+                    except (json.JSONDecodeError, RecursionError):
+                        continue
+                    if isinstance(one, dict):
+                        prior.append(one)
+            prior.append(row)
+            atomic_write_text(
+                log, "\n".join(json.dumps(r, separators=(",", ":"), ensure_ascii=False)
+                               for r in prior[-keep:]) + "\n")
+        return True
+    except Exception:      # noqa: BLE001 — telemetry must never break a session
+        return False
+
+
 SELF_PRUNING_LOGS = ("commands.jsonl", "pointer.jsonl", "scratch.jsonl", "edits.jsonl",
-                    "subagent_start.jsonl")
+                    "subagent_start.jsonl", "block_shape.jsonl", "gate_runs.jsonl",
+                    # One row per subagent run, bounded by record like the rest: what it cost and
+                    # whether it ran on the model its own file declares. A cost history is worth
+                    # having only if it is long enough to compare against, which an age sweep would
+                    # make it not.
+                    "agent_results.jsonl",
+                    # 🐛 [2026-09-10] `state-ages.json` records WHEN each STATE.md section last
+                    # changed, which is the whole input to `state.age_out`. It lived in `logs/`
+                    # and was not exempt, so the 7-day file sweep deleted it — while
+                    # `state_stale_days` is 14. The ages file was therefore erased before anything
+                    # could ever become old enough to hold back, and the ageing pass could not fire
+                    # on any setting. A record of when things happened, deleted on a schedule, is
+                    # the one kind of file an age sweep must never touch.
+                    "state-ages.json",
+                    # 🐛 [2026-09-10] Found by the same check, one line later: `nudge_state.json`
+                    # counts how many times a one-off piece of advice has been shown, capped at
+                    # three. Swept every 7 days, the counter resets and the advice comes back —
+                    # forever, every week — which is precisely what `notice_due`'s own docstring
+                    # says it exists to prevent: "advice that repeats forever is worse than advice
+                    # shown once." A count of showings is a record of when something happened.
+                    "nudge_state.json")
 
 
 def expiring_logs(root=None, within_days=1.0):
@@ -717,6 +818,7 @@ def hook_root(payload=None):
     behaviour. Each is accepted only if it actually contains a workspace or a .git.
     """
     import os
+    resolved = []
     candidates = [os.environ.get("CLAUDE_PROJECT_DIR")]
     if isinstance(payload, dict):
         candidates.append(payload.get("cwd"))
@@ -727,7 +829,7 @@ def hook_root(payload=None):
         # raises TypeError on anything that is not a path-like. A dict, a list or a number there
         # killed chamnan_session_start.py outright — exit 1, ZERO bytes of stdout, a traceback the
         # transcript never sees — and that hook is the one hook of six deliberately NOT wrapped in
-        # `_never_fail_the_session`, on the stated reasoning that it "has something partial worth
+        # `never_fail` below, on the stated reasoning that it "has something partial worth
         # emitting". It has nothing partial to emit when it dies on its first line. The reasoning is
         # sound and the crash simply happened before it could apply, so the fix is here, where a
         # malformed payload becomes "no candidate" rather than an exception (R7 agent 9).
@@ -750,8 +852,32 @@ def hook_root(payload=None):
         except OSError:
             pass
         if (p / WORKSPACE_DIRNAME).is_dir() or (p / ".git").exists():
-            return p
-    return find_root()
+            resolved.append(p)
+    # 🐛 [2026-09-09] The first candidate won, and the first candidate is `CLAUDE_PROJECT_DIR` —
+    # which is the OUTER repository for the whole session. So a hook reacting to work done inside a
+    # nested checkout filed everything under the parent: no `commands.jsonl`, no memory stamp, no
+    # resume pointer and no `STATE.md` for the nested repository, for as long as the session was
+    # opened from the parent, which is how this project's own dogfood shape is normally used. The
+    # read side already knows about this — `chamnan_subagent_start.py` names nested checkouts and
+    # says to use that one if the work is in there — and the write side did not (R1 agent 3).
+    #
+    # A nested workspace wins over the one enclosing it, because filing one project's session data
+    # into another project's workspace mixes two repositories with nothing saying so. Order is
+    # otherwise unchanged: the environment variable the host promises still beats the payload's cwd
+    # whenever neither contains the other.
+    for cand in resolved:
+        if any(other != cand and _is_inside(cand, other) for other in resolved):
+            return cand
+    return resolved[0] if resolved else find_root()
+
+
+def _is_inside(inner, outer):
+    """Is `inner` a directory beneath `outer`? Both are already resolved."""
+    try:
+        inner.relative_to(outer)
+        return inner != outer
+    except ValueError:
+        return False
 
 
 # Every JSON store this package keeps is a handful of keys or a short list. A ceiling here is not a
@@ -862,7 +988,7 @@ def _newer_version_has_been_here(root):
     """
     try:
         seen = (workspace(root) / VERSION_FILE).read_text(encoding="utf-8-sig").strip()
-    except OSError:
+    except (OSError, UnicodeDecodeError):
         return False
     if not seen:
         return False
@@ -1213,7 +1339,7 @@ def reconcile_version(root, running):
     path = workspace(root) / VERSION_FILE
     try:
         seen = path.read_text(encoding="utf-8-sig").strip()
-    except OSError:
+    except (OSError, UnicodeDecodeError):
         seen = ""
     # 🐛 `seen` is the raw contents of a COMMITTED file, and the caller interpolates it into a bold
     # ⚠ banner in chamnan's own voice, outside the fence, on every session. `.strip()` does not
@@ -1238,18 +1364,26 @@ def reconcile_version(root, running):
         # PERSISTING, and a payload that is overwritten on first sight has one session to act
         # instead of every session forever. What is given up is knowing which version was recorded,
         # and that was already unknowable: the string could not be parsed.
-        try:
-            path.write_text(running + "\n", encoding="utf-8")
-        except OSError:
-            pass
+        atomic_write_text(path, running + "\n")
         return "an unreadable version"
     if seen and _as_tuple(running) < _as_tuple(seen):
         return seen
+    # \U0001f41b [2026-09-10] Both writes above and here were `Path.write_text`, which TRUNCATES on
+    # open. `.version` is written by every session that starts in this workspace, and this function
+    # is one of the first things a session does, so two starting together is the ordinary case
+    # rather than the exotic one — one session's read landing inside the other's truncation window
+    # returns "", and a process killed mid-write leaves a short file that `_VERSION_SHAPE` rejects.
+    # That branch does not merely stay quiet: it prints ⚠ "an unreadable version" in chamnan's own
+    # voice, so the failure mode of the unsafe write is a warning about a corruption the write
+    # itself caused.
+    #
+    # `atomic_write_text` is the fix this repository already made in five other places — `state.py`
+    # first, then `coedit.py`, `rollup.py`, `pointer.py` and `chamnan-map`. This was the sixth and
+    # was not on that list. No lock is wanted here on top of it: every writer is putting down the
+    # same string, so a lost update costs nothing, and a session must never wait on a lock to learn
+    # its own version (R4 agent 1).
     if seen != running:
-        try:
-            path.write_text(running + "\n", encoding="utf-8")
-        except OSError:
-            pass
+        atomic_write_text(path, running + "\n")
     return ""
 
 
@@ -1594,8 +1728,6 @@ def safe_tool_name(name):
     # 🐛 `mdblock.filename_safe` exists because a tool named "con" or "nul" becomes `con.sh` or
     # `nul.sh`, which on Windows are the console and the bit-bucket: the write does not fail, it
     # goes to the DEVICE and the tool is gone, while `tools/index.json` records it as promoted.
-    # Its docstring says "both slug() functions in this codebase" — there are five, and this was
-    # one of the three that never called it (R2 agent 1).
     import mdblock
     return mdblock.filename_safe(name)
 
@@ -1603,12 +1735,18 @@ def safe_tool_name(name):
 # A mutex built from os.open(O_CREAT|O_EXCL), which is atomic on POSIX and on Windows alike, so it
 # needs neither fcntl nor msvcrt and stays inside the standard library.
 #
-# lib/pointer.py faced the same lost-update problem and chose NOT to lock: it gave every session its
-# own file, and its comment sets out why — flock is not reentrant across two descriptors in one
-# process, and fcntl drops every lock a process holds the moment ANY descriptor to the file closes.
-# That answer is right there and wrong here. `tools/index.json` is a shared registry: every session
-# has to see the same list of tools, so per-session files are not available and a lock is the only
-# thing left.
+# Two things this mutex is deliberately NOT: not `flock`, which is not reentrant across two
+# descriptors in one process, and not `fcntl`, which drops every lock a process holds the moment ANY
+# descriptor to the file closes. `tools/index.json` is a shared registry — every session has to see
+# the same list of tools — so sidestepping the problem with a file per session, the way some logs
+# can, is not available here and a lock is the only thing left.
+#
+# 🐛 [2026-09-10] The paragraph above used to say that `lib/pointer.py` had faced the same
+# problem and answered it with a file per session. It had not: `pointer.EVENT_LOG` is one shared
+# path carrying `session` as a FIELD, and its trim was an unlocked read-modify-write on it — the
+# very lost update this mutex exists for, held up here as the example of not needing one. It now
+# calls `append_jsonl`, below, which takes this lock. A design note describing a design the code has
+# left is worse than no note: it argues against the fix.
 #
 # Held for a read-modify-write of a few hundred bytes, so the wait is bounded and short. A lock left
 # behind by a killed process is broken after LOCK_STALE seconds rather than waited on forever, and
@@ -2119,12 +2257,36 @@ def git_hooks_dir(root):
     return None
 
 
-def git_hook_state(root):
-    """"installed", "absent", "theirs", or None when the question does not apply here.
+# 🐛 [2026-09-09] The hook is a GENERATED artifact and nothing ever noticed it drifting from the
+# template that generates it — the identical disease it was written to cure for `MAP.md`. Verified
+# on this repository: the installed copy was from 2026-09-07 and was missing the whole
+# `chamnan-context --write` refresh loop and both bug fixes made to it since, so it rebuilt the map
+# and refreshed no adapter file at all. `--install-git-hook` printed "already installed" and
+# changed nothing, and the session-start warning stayed silent, because both asked only whether the
+# marker was there. A repository that installed it once runs that version forever (R5 agent 5).
+#
+# The stamp is eight hex of a hash of the body, written into the marker line at install and
+# compared on every ask. Short on purpose: this answers "is it the same text", and a full digest in
+# a shell comment is noise nobody reads.
+GIT_HOOK_STAMP = "# stamp:"
+
+
+def git_hook_stamp(body):
+    """The eight-character mark that says which template an installed hook was made from."""
+    return hashlib.sha256(body.encode("utf-8")).hexdigest()[:8]
+
+
+def git_hook_state(root, current_body=None):
+    """"installed", "stale", "absent", "theirs", or None when the question does not apply here.
 
     "theirs" means a pre-commit hook exists and is not chamnan's -- which is not a problem and must
     not be reported as one. The distinction matters because the advice differs: an absent hook can
     be offered, and somebody else's cannot be touched.
+
+    "stale" is chamnan's own hook, made from an older template. It is only ever returned when the
+    caller passes the template it is comparing against; a caller that cannot know the current body
+    gets "installed" exactly as before, because reporting drift it did not measure would be worse
+    than saying nothing.
     """
     hooks = git_hooks_dir(root)
     if hooks is None:
@@ -2133,10 +2295,19 @@ def git_hook_state(root):
     if not target.is_file():
         return "absent"
     try:
-        return ("installed" if GIT_HOOK_MARKER in
-                target.read_text(encoding="utf-8-sig", errors="replace") else "theirs")
+        existing = target.read_text(encoding="utf-8-sig", errors="replace")
     except OSError:
         return None
+    if GIT_HOOK_MARKER not in existing:
+        return "theirs"
+    if current_body is None:
+        return "installed"
+    want = git_hook_stamp(current_body)
+    # An installed hook with no stamp at all predates this check. It is reported as stale rather
+    # than as current: it cannot be the present template, because the present template stamps
+    # itself, and telling somebody their months-old copy is fine is the failure being fixed.
+    found = re.search(re.escape(GIT_HOOK_STAMP) + r"\s*([0-9a-f]{8})", existing)
+    return "installed" if found and found.group(1) == want else "stale"
 
 
 # ---------------------------------------------------------------- the command line, asked once
@@ -2160,6 +2331,57 @@ def wants_version(argv):
     typing it and getting "unknown flag" is worse than useless.
     """
     return any(a in VERSION_FLAGS for a in (argv or []))
+
+
+def nonce_for(session_id):
+    """A fence marker constant for one session and unguessable from inside the repository.
+
+    🐛 `secrets.token_hex` used to be called at import, which made the marker per INVOCATION rather
+    than per session — the thing its own comment said it was. The hook re-runs on every resume and
+    every compaction, so one session was measured emitting 39 blocks carrying 42 different markers,
+    and the whole ~8.5 KB block therefore differed from the one before it. That is exactly the
+    prefix invalidation the fence is the one permitted exception to, caused by the fence.
+
+    Deriving it from the session id keeps the security property. What the marker has to resist is a
+    file in the repository closing the fence early, and a file is written before the session exists,
+    so its author cannot know the id. A plain digest rather than a keyed one on purpose: the
+    unpredictability lives in the session id, not in a secret this would have to store somewhere.
+
+    🐛 [2026-09-10] Written out in both hooks that emit a fenced block, and only one of them carried
+    the paragraphs above — so the copy a reader was most likely to meet second was the one with no
+    reason attached. Two identical derivations of a security-relevant value is two chances for them
+    to stop being identical (R1, the duplicate-body sweep).
+    """
+    if not session_id:
+        return secrets.token_hex(3)          # no id in the payload: fall back to a random marker
+    return hashlib.blake2s(str(session_id).encode("utf-8"), digest_size=3).hexdigest()
+
+
+def never_fail(main):
+    """Run a hook's `main()` and return 0 whatever it raises. The return value is an exit code.
+
+    A hook's stderr never reaches the transcript, so a crash is INVISIBLE: the session simply starts
+    without whatever that hook contributes, and nothing says why. Measured with a `chmod 000` on
+    `.chamnan/logs` — the ordinary result of a container or CI run touching the workspace as root —
+    four of five hooks died that way. Silence is the correct failure for a hook that only writes.
+
+    `chamnan_session_start.py` deliberately does NOT use this: it has partial output worth emitting
+    when something fails, so it handles its own failures and says what it managed to produce.
+
+    🐛 [2026-09-10] These four lines were written out in SIX hooks, byte for byte, and the sixth was
+    added the same week by copying the fifth. Every copy was correct, so nothing had gone wrong yet —
+    and this package's most recorded defect is what happens next: somebody finds a problem in one and
+    fixes the copy in front of them. It is the wrapper whose entire job is that a hook must never
+    take a session down, so the version that is subtly different from the other five is the one that
+    does (R1, the duplicate-body sweep).
+
+    `BaseException` is not caught. A `KeyboardInterrupt` or a `SystemExit` is somebody or something
+    deliberately stopping this process, and swallowing that would make a hook unkillable.
+    """
+    try:
+        return main()
+    except Exception:      # noqa: BLE001 — the whole point: a hook must not take a session down
+        return 0
 
 
 def version_line():
@@ -2297,7 +2519,7 @@ def _config_problem(path):
 # does not fail. It WALKS UP and answers about the nearest real repository above it.
 #
 # Twelve call sites shelled out to `git -C root ...` on that assumption and every one of them was
-# reporting somebody else's repository (R6 acc3, first ten minutes). Reproduced: in a directory
+# reporting somebody else's repository (R6 acc3, 2026-09-06, first ten minutes). Reproduced: in a directory
 # holding one file and an empty `.git/`, nested inside a real repository, the session-start block
 # said "10 uncommitted file(s)" and named a branch — the ANCESTOR's status; `chamnan-map` stamped
 # `Built from <sha>` into MAP.md with the ancestor's HEAD; and `--install-git-hook` resolved
@@ -2382,6 +2604,43 @@ def git_toplevel(root):
 
 
 _GIT_SPEAKS = {}
+
+
+def git_folds_case(root):
+    """git's own `core.ignorecase` for `root`. False when git cannot answer.
+
+    \U0001f41b [2026-09-09] `fnmatch.fnmatch` normalises case with `os.path.normcase`, which folds
+    on Windows and does not on macOS or Linux. git decides the same question with `core.ignorecase`,
+    and the two disagree on this machine's own defaults: `core.ignorecase` is TRUE here because the
+    filesystem is case-insensitive, while `os.name` is posix so `fnmatch` is case-SENSITIVE. Every
+    gitignore and gitattributes pattern chamnan evaluated therefore diverged from what git itself
+    answers — measured against real `git check-ignore`, which called `Dockerfile` and `notes.MD`
+    ignored where chamnan called both visible. On Windows it diverges the other way (R10 agent 1,
+    findings 1 and 2).
+
+    It lives here rather than in `tree`, where it is used, for two reasons that are the same reason:
+    this is where git lives, and `git_can_speak_for` below is the guard every path-scoped read has
+    to pass. Asking a PARENT repository how it folds case, in a workspace deliberately placed in a
+    subproject, is exactly the error that guard exists to stop.
+
+    False on any doubt: case-sensitive matching is git's documented default, so an unreadable or
+    absent config degrades to the standard behaviour rather than to a guess.
+    """
+    if not git_can_speak_for(root):
+        return False
+    import subprocess          # deferred, as everywhere else in this module -- see the note at the
+                               # import block: the hooks that run on every tool call pay for imports
+                               # they mostly do not reach.
+    try:
+        r = subprocess.run(["git", "-C", str(root), "config", "--get", "core.ignorecase"],
+                           capture_output=True, text=True, encoding="utf-8", errors="replace",
+                           timeout=5)
+    except git_cannot_answer():
+        # The one definition of "git could not answer", shared by every caller here. Spelling it
+        # out as `(OSError, subprocess.SubprocessError)` is how the set of things that count as a
+        # git failure comes to differ between two callers — the suite refuses it for that reason.
+        return False
+    return r.stdout.strip().lower() == "true"
 
 
 def git_can_speak_for(root):

@@ -153,14 +153,6 @@ SCHEMA_HINTS = ("migration", "migrations", "schema", "models", "db", "database",
 # `rel.parts`, which is what made the asymmetry findable. Two harms beyond the missing sections:
 # `mapper.scan` is unaffected, so the index and the catalogues then disagree about the same
 # repository; and the unignored-`.env` warning goes silent, which is the false-calm direction.
-def _rel_parts(path, root):
-    """`path`'s components below `root`, or its own components when it is not below root."""
-    try:
-        return pathlib.Path(path).relative_to(root).parts
-    except (ValueError, TypeError):
-        return pathlib.Path(path).parts
-
-
 def _summary_above(text, pos):
     """A comment block immediately above a definition, used as its one-line summary."""
     m = COMMENT_ABOVE.search(text[:pos])
@@ -262,7 +254,7 @@ def scan(root, files):
         # shared pruned walk could not include virtualenvs. A .sql inside one is a dependency's
         # schema, never this repository's.
         if any(p in (".git", "node_modules", "vendor", "__pycache__", ".venv")
-               for p in _rel_parts(path, root)) \
+               for p in tree.rel_parts(path, root)) \
                 or redact.is_blocked(path):
             continue
         try:
@@ -407,7 +399,7 @@ def render(tables):
     # bounded the count and nothing bounded what a row costs, so the product ran away: 40 tables
     # with an ordinary 140-character summary rendered 3,866 tokens against a 3,000-token index
     # budget. The third section with this defect, after routes/configuration and the deployment
-    # section, both fixed from the same diagnosis (R5 acc3).
+    # section, both fixed from the same diagnosis (R5 acc3, 2026-09-07).
     #
     # And the cliff was INVERTED, which is why nobody noticed: 41 tables took the names-only branch
     # and cost 674 tokens while 40 took the detailed one and cost 3,866. The "large schema" path was
