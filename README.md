@@ -52,21 +52,30 @@ the research on that, including the measurements that argue against doing this a
 ## Measured with this page
 
 Every row below was produced by this page in a real browser and cross-checked against the same
-modules run natively. The pattern is the point rather than any single ratio: **the source grows
-sixty-fold down the table and the injected block stays between 6.4 and 6.6 KB.** That is a bound,
-not compression.
+modules run natively. Fourteen repositories across eight languages. The pattern is the point rather
+than any single ratio: **the source grows nearly seventy-fold down the table and the injected block
+holds between 6.2 and 6.7 KB for every repository but the smallest.** That is a bound, not
+compression.
+
+Measured 2026-09-14. These repositories are worked on daily, so re-running one today will not match
+to the byte — the shape holds, the digits move.
 
 | repository | language | source | injected | ratio |
 |---|---|---|---|---|
-| chalk/chalk | JavaScript | 60 KB | 2,678 B | 23:1 |
-| psf/requests | Python | 398 KB | 6,485 B | 63:1 |
+| chalk/chalk | JavaScript | 56 KB | 2,449 B | 24:1 |
+| fastapi/fastapi | Python | 61 KB | 6,454 B | 10:1 |
+| facebook/react | JavaScript | 256 KB | 6,649 B | 39:1 |
+| psf/requests | Python | 392 KB | 6,345 B | 63:1 |
 | pallets/flask | Python | 576 KB | 6,391 B | 92:1 |
+| gin-gonic/gin | Go | 660 KB | 6,636 B | 102:1 |
 | sinatra/sinatra | Ruby | 663 KB | 6,570 B | 103:1 |
-| gin-gonic/gin | Go | 675 KB | 6,620 B | 104:1 |
-| rust-lang/mdBook | Rust | 1,187 KB | 6,465 B | 188:1 |
-| tokio-rs/tokio | Rust | 2,609 KB | 6,492 B | 412:1 |
-| torvalds/linux | C | 2,874 KB | 6,545 B | 450:1 |
-| vuejs/core | TypeScript | 3,762 KB | 6,492 B | 593:1 |
+| yumiaura/myCat | Mixed | 719 KB | 6,409 B | 115:1 |
+| rust-lang/mdBook | Rust | 1,191 KB | 6,470 B | 188:1 |
+| rails/rails | Ruby | 1,550 KB | 6,537 B | 243:1 |
+| django/django | Python | 2,209 KB | 6,245 B | 362:1 |
+| torvalds/linux | C | 3,028 KB | 6,603 B | 470:1 |
+| tokio-rs/tokio | Rust | 3,481 KB | 6,441 B | 553:1 |
+| vuejs/core | TypeScript | 3,782 KB | 6,250 B | 620:1 |
 
 ## Rebuilding the bundled modules
 

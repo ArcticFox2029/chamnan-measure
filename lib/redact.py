@@ -79,7 +79,19 @@ def _is_a_plain_word(value):
     with `(`, and the assignment rules still cover `password = {...}` if one ever did.
     """
     value = value or ""
-    return bool(_PLAIN_WORD.match(value)) or value[:1] in "([{"
+    if bool(_PLAIN_WORD.match(value)) or value[:1] in "([{":
+        return True
+    # 🐛 [2026-09-13] R12.26: the prose guard was ASCII-only, so an ordinary translated word
+    # beside a credential label was treated as the value itself. The R7 external corpus caught
+    # `password: contraseña.`; the same defect applies to every alphabetic script. Keep the old
+    # length and hyphen bounds, but let Python's Unicode alphabet test answer what a letter is.
+    bare = value.rstrip(".,;:!?)]}\u2026\"'`")
+    parts = bare.split("-")
+    return (any(not char.isascii() for char in bare)
+            and 1 <= len(parts) <= 4
+            and all(2 <= len(part) <= 18
+                    and all(unicodedata.category(char)[:1] in ("L", "M") for char in part)
+                    for part in parts))
 
 
 def _is_a_type_annotation(match):
@@ -132,7 +144,7 @@ _DECLARATION_KEYWORD = re.compile(
 _PRIMITIVE_TYPE = re.compile(
     r"^(?:string|str|int|integer|number|num|float|double|decimal|bool|boolean|byte|bytes"
     r"|char|long|short|any|unknown|never|void|null|nil|none|object|date|datetime|uuid|guid"
-    r"|list|dict|map|array|set|tuple|error|time|duration|interface\{\})[;,)\]}]*$", re.I)
+    r"|list|dict|map|array|set|tuple|error|time|duration|interface\{\})!?[;,)\]}]*$", re.I)
 
 # A dotted run of identifier components with at least one capitalised: `P256.Signing.PrivateKey`,
 # `System.Security.Cryptography.RSA`. Swift, C# and Java spell a fully-qualified type this way, and
@@ -295,9 +307,52 @@ LATE_PREFIXES = [
     re.compile(r"(?<![A-Za-z0-9_-])dp\.(?:pt|st|ct|sa|scim|audit)\.[A-Za-z0-9_-]{20,}"),
 ]
 
+# [R8 2026-09-13, closed out] The non-English credential words the ASSIGNMENT path
+# (`key = "value"`, `key: value`, `{"key": "value"}`) needs, and the same words `_HEADER_BARE`
+# (below, ~line 2190) needs for CSV/table header-row detection -- R7 measured these words work for
+# a header row but not for an assignment, same word different syntax, one path fixed on 2026-09-09
+# and the sibling never touched. Defined here, ahead of `SECRET_WORDS`, and `_HEADER_BARE` reads
+# THIS constant instead of retyping it: Python executes a module top to bottom, so a name already
+# bound here is in scope by the time `_HEADER_BARE` is built, however many lines later that is --
+# there was never an ordering problem, only an unnoticed option to share. There is now exactly one
+# non-English credential-word list in this file; reconciling the two copies surfaced a real drift
+# between them, kept rather than dropped: `_HEADER_BARE` alone had `parola[_ -]?chiave` (Italian
+# for "keyword"), folded into `_HEADER_BARE`'s own definition below since it is a header-only term.
+#
+# Arabic and Hindi, added 2026-09-13 to close the two languages R7 and R8 both measured at 0/6
+# recall on the assignment path (and 0/0 everywhere else, since neither language had a word typed
+# in anywhere in the file). `كلمة المرور` is the standard modern Arabic for "password" -- the term
+# Arabic-locale Google, Facebook and Windows all use -- and it is two words, unlike every other
+# entry here. `पासवर्ड` is the Hindi transliteration of "password", the spelling real Hindi-locale
+# software actually shows on a login screen, not the rarer, more formal `कूटशब्द`.
+#
+# The two-word Arabic case needs nothing special from `re` beyond the separator handling already
+# used for French below. Arabic reads right-to-left on screen, but Unicode stores and `re` matches
+# CODEPOINTS in logical (typed) order, not visual order, so `كلمة` (word) still precedes `المرور`
+# (passing/transit) in the string exactly as it was typed -- no bidi-aware regex logic is needed to
+# match it left-to-right the normal way. What the two words DO need is a separator class: a
+# compound identifier would join them with `_` or `-`, and a JSON/YAML string key would join them
+# with an ordinary space, so both are accepted here the same way `mot[_ -]?de[_ -]?passe` already
+# accepts either for French.
+_NONENGLISH_SECRET_WORDS_BY_SCRIPT = {
+    "Latin": (
+        r"contrase[ñn]a|clave|senha|palavra[_ -]?passe|mot[_ -]?de[_ -]?passe|motdepasse"
+        r"|kennwort|passwort|geheimnis|parola|segreto|wachtwoord|geheim"
+        r"|has[lł]o|[şs]ifre|m[aậ]t[_ -]?kh[aẩ]u|matkhau|kata[_ -]?sandi"
+    ),
+    "Thai": r"รหัสผ่าน|รหัส",
+    "CJK": r"密码|密碼|口令|秘密|パスワード|暗証番号",
+    "Hangul": r"비밀번호|암호",
+    "Cyrillic": r"пароль|секрет|ключ",
+    "Arabic": r"كلمة[_ -]?المرور",
+    "Devanagari": r"पासवर्ड",
+}
+_NONENGLISH_SECRET_WORDS = "|".join(_NONENGLISH_SECRET_WORDS_BY_SCRIPT.values())
+
+
 # The names that mean "a credential lives here". Written once and shared by the assignment
 # patterns below, which had drifted -- one had gained spellings the other had not.
-SECRET_WORDS = (
+_LATIN_SECRET_WORDS = (
     # Each one a whole COMPONENT of the name, with a plural allowed. These were bare substrings
     # while `key` and `auth` beside them were carefully bounded -- the same bug, left in the words
     # nobody re-read. Measured: `self.tokenizer_config = AutoTokenizer.from_pretrained(model_name)`
@@ -343,6 +398,21 @@ SECRET_WORDS = (
     # the identifier family this module's own docstring says was already fixed once. The credential
     # spellings — access_token, auth_token, api_token, refresh_token — all carry one.
     r"|(?<![A-Za-z])[A-Za-z0-9]+[_-]tokens?(?![A-Za-z])"
+    # \U0001f41b [2026-09-11] ...and the same component on the OTHER side. `token` and `key`
+    # require a neighbour, for the measured reason above -- but the rule only ever looked LEFT,
+    # so `TOKEN_A=`, `TOKEN_B=`, `KEY_OLD=` and `TOKEN_PROD=` had no rule at all while
+    # `DB_TOKEN=` and `access_token_a=` were caught, and while every one of the other ten
+    # credential words was caught in that shape. Found by probing an outward finding that was
+    # itself wrong: a secret split across `TOKEN_A`/`TOKEN_B` was the case it could not see
+    # (R3 agent2). A real key-shaped line in this machine's own tree, spelled `KEY_1=`, is
+    # unredacted today and caught by this.
+    #
+    # A LEADING credential word is weaker evidence than a trailing one -- `token_uri`,
+    # `token_cost` and `key_first` are ordinary names, and `token_uri` sits in every Google
+    # service-account file holding a public URL -- so the value has to agree before this
+    # fires. That condition lives in `_looks_like_a_credential_name`, which every assignment
+    # rule already calls, rather than in each rule's own guard chain.
+    r"|(?<![A-Za-z])tokens?[_-][A-Za-z0-9]+(?![A-Za-z])"
     # 🐛 [2026-09-09] `pass` was absent from this list in every form, and `ansible_ssh_pass` /
     # `ansible_become_pass` are Ansible's own documented inventory variables rather than a guess —
     # they sit in inventory files and playbooks in the open. `db_pass` and `mysql_pass` are the
@@ -354,9 +424,42 @@ SECRET_WORDS = (
     # from `    pass` — and it costs nothing on the secret side, because every real spelling of
     # this one carries a prefix (R1 agent 2).
     r"|(?<![A-Za-z])[A-Za-z0-9]+[_-]pass(?:words?)?(?![A-Za-z])"
+    # \U0001f41b [2026-09-11] ...and the same word in SCREAMING_CASE, which the separator rule above
+    # cannot reach and which the 2026-09-10 fix gave to `TOKEN` and `KEY` and not to this one.
+    # `PASS=hunter2`, `DBPASS=`, `FTPPASS=` and `MYSQLPASS=` all passed through byte for byte, beside
+    # `PASSWORD=`, `PWD=` and `DB_PASS=`, which were caught. Ten members of the set were handled and
+    # the eleventh was not, which is this repository's most recorded defect, for the tenth time.
+    #
+    # The reason `pass` needs a leading component does not survive the case change, and that is what
+    # makes this safe rather than a relaxation: the component exists to separate a credential from
+    # Python's `pass` STATEMENT, and the statement is lowercase. Under `(?-i:)` an all-caps `PASS`
+    # cannot be it. So the prefix becomes optional here where it stays required one line above.
+    #
+    # The English words ending in -PASS are excluded by name, for the reason the `KEY` branch gives
+    # in full: credential prefixes are an open set that grows with every vendor, English words ending
+    # in "pass" are a closed one. `BYPASS=1` being destroyed is the same damage as `MONKEY_PATCH=1`.
+    # Written as a lookahead on the WHOLE word, so `BYPASSKEY` is still caught rather than smuggled.
+    r"|(?-i:(?<![A-Za-z])(?!(?:BY|COM|ENCOM|OVER|SUR|TRES|UNDER|RE|OUT)PASS(?:ES)?(?![A-Z0-9]))"
+    r"[A-Z0-9]*PASS(?:WORD)?S?)(?![A-Za-z])"
+    # `PWD` and `CRED` are the same omission one size down. Both are caught bare and after a
+    # separator, and neither was reachable with a SCREAMING prefix run against it -- `DBPWD=` and
+    # `APICRED=` beside `DB_PWD=` and `API_CRED=`, which were. A prefix is REQUIRED here, unlike
+    # `PASS` above, because three and four letters land inside real words too easily to give up the
+    # left boundary; `SACRED` is the one English word that ends in `CRED` and it is excluded by name.
+    r"|(?-i:(?<![A-Za-z])[A-Z0-9]+PWDS?)(?![A-Za-z])"
+    r"|(?-i:(?<![A-Za-z])(?!SACRED(?![A-Z0-9]))[A-Z0-9]+CREDS?)(?![A-Za-z])"
     # ...and the same words in CamelCase, where there is no separator to anchor on: dbPassword,
     # apiToken. Case-sensitive under `(?-i:)` for the reason the `key` branch below gives.
-    r"|(?-i:(?<=[a-z0-9])(?:Password|Passwd|Secret|Token|Credential)s?)(?![A-Za-z])"
+    # \U0001f41b [2026-09-11] `Pwd`, `Cred`, `Storepass` and `Keypass` were absent from this list
+    # while sitting in the bare-word list two branches up, so `dbPwd = "..."` and `userCreds = "..."`
+    # leaked where `dbPassword` and `dbSecret` did not. The same set, the same omission, one line
+    # apart. The right boundary is what keeps `userCredit` and `totalCredits` out of it.
+    # `StorePass` and `KeyPass` carry the capital at each component, which is how CamelCase actually
+    # spells a two-word name and which the single-capital spellings beside them do not match. `Pass`
+    # on its own cannot join this list -- `lowPass`, `firstPass` and `bandPass` are ordinary
+    # identifiers -- so the two real credential names are written out instead.
+    r"|(?-i:(?<=[a-z0-9])(?:Password|Passwd|Passphrase|Secret|Token|Credential"
+    r"|Pwd|Cred|Storepass|Keypass|StorePass|KeyPass)s?)(?![A-Za-z])"
     # 🐛 [2026-09-10] ...and the same words in SCREAMING_CASE, which is how an env file and a CI
     # config actually spell them, and where there is neither a separator nor a case change to
     # anchor on. `APITOKEN`, `ACCESSKEY`, `PRIVATEKEY`, `SECRETTOKEN` and `CIRCLETOKEN` all passed
@@ -395,6 +498,7 @@ SECRET_WORDS = (
     # and stops the single largest source of damage on the other. `password`, `secret` and
     # `credential` keep their bare form, because `password = "…"` really is one.
     r"|(?<![A-Za-z])[A-Za-z0-9]+[_-]keys?(?![A-Za-z])"
+    r"|(?<![A-Za-z])keys?[_-][A-Za-z0-9]+(?![A-Za-z])"
     # ...and the same component written in CamelCase, where there is no separator to anchor on:
     # AccountKey, ApiKey, PrivateKey. `(?-i:...)` turns the surrounding re.I off for this branch
     # only, because the distinction IS the case -- a capital K after a lowercase letter is a word
@@ -422,7 +526,55 @@ SECRET_WORDS = (
     # said so.
     r"|(?<![A-Za-z])(?:apikey|secretkey|authtoken|accesstoken"
     r"|sessiontoken|refreshtoken)s?(?![A-Za-z])"
+    # Latin-script translations belong on the ASCII route too. Language is not a character set:
+    # `passwort`, `parola`, `kata_sandi`, and the unaccented alternatives in the classes below are
+    # non-English and pure ASCII. Grouping them with the Latin script is what keeps that route from
+    # silently reopening the leak the vocabulary closed.
+    r"|(?:" + _NONENGLISH_SECRET_WORDS_BY_SCRIPT["Latin"] + r")(?![A-Za-z])"
 )
+
+# The vocabulary is grouped by the script its words occupy, never by language. The full public
+# constant remains available for callers and checks. Unspaced scripts get their own key-suffix
+# method: ordinary Thai, Han/Kana and Hangul compounds do not insert a separator after the
+# credential word. Spaced scripts keep the existing boundary behaviour that protects
+# `passwordless` and `password_hash_algorithm`.
+_UNSPACED_SCRIPT_SUFFIXES = {
+    "Thai": r"[\u0e00-\u0e7f]*",
+    "CJK": r"[\u3040-\u30ff\u31f0-\u31ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]*",
+    "Hangul": r"[\u1100-\u11ff\u3130-\u318f\uac00-\ud7af]*",
+}
+_SPACED_SCRIPT_BOUNDARIES = {
+    "Cyrillic": r"(?![\u0400-\u052f\u2de0-\u2dff\ua640-\ua69f])",
+    "Arabic": r"(?![\u0600-\u06ff\u0750-\u077f\u08a0-\u08ff\ufb50-\ufdff\ufe70-\ufeff])",
+    "Devanagari": r"(?![\u0900-\u097f\ua8e0-\ua8ff])",
+}
+_SECRET_WORDS_BY_SCRIPT = {
+    "Latin": _LATIN_SECRET_WORDS,
+    **{name: words for name, words in _NONENGLISH_SECRET_WORDS_BY_SCRIPT.items()
+       if name != "Latin"},
+}
+
+def _secret_words_for_scripts(scripts):
+    """The credential-word pattern for `scripts`, with each script's own boundary method."""
+    parts = []
+    for script in scripts:
+        words = _SECRET_WORDS_BY_SCRIPT[script]
+        suffix = _UNSPACED_SCRIPT_SUFFIXES.get(
+            script, _SPACED_SCRIPT_BOUNDARIES.get(script, ""))
+        parts.append(r"(?:" + words + r")" + suffix)
+    return "|".join(parts) or r"(?!)"
+
+
+# 🐛 [2026-09-13] The earlier dead-end note blamed `text.isascii()` for an O(n) scan. That was
+# false: CPython stores the ASCII state in the string header, and 60-character and 120,000-character
+# measurements were both about 0.1 microseconds. The cost is the large Latin alternation, not script
+# detection. A one-pass source-script router was implemented and measured after profiling the whole
+# function: median CPU recovered 4.2% on ASCII and 4.5% on Thai-heavy configuration, but made mixed-
+# script input 3.8% slower. Pure Thai prose gained 84%, but one ordinary Latin-valued assignment
+# activates the Latin route and removes that advantage. Runtime dispatch was therefore reverted as
+# complexity inside the noise. The script grouping remains because it gives unspaced scripts their
+# correct substring method, while spaced scripts retain a right boundary.
+SECRET_WORDS = _secret_words_for_scripts(tuple(_SECRET_WORDS_BY_SCRIPT))
 
 # A compiled regular expression is not a credential, whatever it is called. `TOKEN_RE`,
 # `TOKEN_LEAK_RE` and `SECRET_PATTERN` are the names a scanner gives its own patterns — including
@@ -880,6 +1032,13 @@ def _redact_literals_in(expr):
     return "".join(out)
 
 
+# A name whose FIRST component is `token` or `key`, with something after it. This is the weak
+# half of the evidence the trailing form carries: `api_token` is a credential, `token_uri` is a URL,
+# and the difference is not in the name. Matched case-insensitively and anchored at the start, so
+# `DB_TOKEN` and `access_token` -- where the word TRAILS -- are not in this population at all.
+_CREDENTIAL_WORD_LEADS = re.compile(r"\A(?:tokens?|keys?)[_-][A-Za-z0-9]", re.I)
+
+
 def _looks_like_a_credential_name(key, value=None):
     """False when the name's own tail says it is something other than a credential.
 
@@ -888,6 +1047,14 @@ def _looks_like_a_credential_name(key, value=None):
     header or an ordering, and no value it holds is a secret.
     """
     bare = re.sub(r"['\"\s:=]+$", "", (key or "").strip())
+    # \U0001f41b [2026-09-11] A LEADING credential word only counts when the value agrees. Without
+    # this, teaching `SECRET_WORDS` to look right as well as left destroyed `"token_uri":
+    # "https://oauth2.googleapis.com/token"` -- a public URL in every Google service-account file --
+    # along with `token_cost` and `key_first`. Measured over 8,806 files: the ungated version
+    # destroyed 21 ordinary lines, this one destroys none of them and still catches every
+    # `TOKEN_A=` shape (R3 agent2, found by probing a claim that was itself wrong).
+    if _CREDENTIAL_WORD_LEADS.match(bare) and not _value_overrides_the_name(value, key):
+        return False
     if not _NOT_A_CREDENTIAL_NAME.search(bare):
         return True
     # 🐛 The tail decided alone, so ~50 ordinary endings — `id`, `type`, `name`, `field` — exempted
@@ -1154,6 +1321,48 @@ def _full_key_at(match):
     return text[j:i] + (match.group(1) or "")
 
 
+def _inside_sql_comment_on(match):
+    """True when this apparent `key IS value` is the object named by SQL `COMMENT ON`."""
+    before = match.string[:match.start()]
+    statement = before[before.rfind(";") + 1:]
+    return bool(re.search(r"\bCOMMENT\s+ON\b", statement, re.I | re.S))
+
+
+_NONCREDENTIAL_KEY_PREFIXES = frozenset(("cache", "list", "partition", "idempotency"))
+
+
+def _has_noncredential_key_prefix(match):
+    key = _bare_key(_full_key_at(match))
+    return key.split("_", 1)[0] in _NONCREDENTIAL_KEY_PREFIXES
+
+
+def _is_local_key_derivation(match):
+    """True for a Lua local key assembled from a short label and a following concatenation."""
+    line_start = match.string.rfind("\n", 0, match.start()) + 1
+    prefix = match.string[line_start:match.start()]
+    line_tail = match.string[match.end():].split("\n", 1)[0]
+    return bool(_has_noncredential_key_prefix(match)
+                and re.search(r"\blocal\s+$", prefix)
+                and re.match(r"\s*\.\.", line_tail))
+
+
+def _is_documented_field_name(match):
+    """True for an identifier named in a source comment, rather than a value assigned in code."""
+    line_start = match.string.rfind("\n", 0, match.start()) + 1
+    prefix = match.string[line_start:match.start()]
+    value = (match.group(2) or "").strip().strip("\"'").rstrip(".,;:)]}")
+    return (_has_noncredential_key_prefix(match)
+            and bool(re.match(r"\s*(?://|#|--)", prefix))
+            and bool(re.fullmatch(r"[A-Za-z][A-Za-z0-9_]*_id", value)))
+
+
+def _is_documented_prose(match):
+    """True when a source comment describes a credential with an ordinary prose word."""
+    line_start = match.string.rfind("\n", 0, match.start()) + 1
+    prefix = match.string[line_start:match.start()]
+    return bool(re.match(r"\s*(?://+|#|--|/\*+|\*)", prefix)) and _is_a_plain_word(match.group(2))
+
+
 # The values people actually leave in place. Short and closed on purpose: every entry is a real
 # default shipped by a real product or a top-of-the-list password, and nothing here is a word
 # a form label or a translation table would hold. `secrets`, `credential` and `token` are
@@ -1189,7 +1398,34 @@ def _value_is_the_key_itself(key_part, value):
     # `isalpha()` on that and answered False — the guard was written, wired into both rules, and
     # still did nothing. Its own test caught it.
     word = value.strip().strip("\"'").strip(",;:)]}\"' ").lower()
-    if not word or not word.isalpha():
+    if not word:
+        return False
+    # 🐛 [2026-09-13] R12.26: Codable/JSON-key enums spell one label twice using the two naming
+    # conventions on either side: `accessToken = "access_token"`. Comparing only alphabetic
+    # words made the underscore disqualify the value before the names were compared. Canonical
+    # alphanumeric equality covers camel/snake/kebab siblings without exempting a different value.
+    canonical_key = re.sub(r"[^a-z0-9]+", "", _bare_key(key_part))
+    canonical_word = re.sub(r"[^a-z0-9]+", "", word)
+    # 🐛 [2026-09-14] This branch answered "label" for EVERY key whose value repeats it, and it runs
+    # before the case rule at the bottom of this function — so the bottom rule, whose whole job is
+    # to separate `SECRET = "secret"` (the enum idiom) from `secret = "secret"` (a credential
+    # somebody did not choose), was unreachable for every word except `password`. `password` only
+    # escaped because it is in `_DEFAULT_CREDENTIALS` and this branch steps around that list.
+    # `secret`, `token`, `key`, `credential`, `apikey`, `auth`, `cred` and `passphrase` all leaked
+    # their value byte for byte. The fix that closed `password = "password"` landed on one member of
+    # a set of twelve — this repository's most frequent defect, recorded nineteen times.
+    #
+    # The narrow thing this branch is FOR is the two-naming-convention enum: `accessToken =
+    # "access_token"`, where key and value are the same name SPELLED DIFFERENTLY. That is why it
+    # compares canonically. When the two spellings are identical there is no convention gap to
+    # explain, and the question is exactly the one the bottom of this function answers from case —
+    # so defer to it rather than answering here.
+    _same_spelling = _bare_key(key_part) == word
+    if (canonical_word and canonical_word == canonical_key
+            and word not in _DEFAULT_CREDENTIALS
+            and not _same_spelling):
+        return True
+    if not word.isalpha():
         return False
     # \U0001f41b [2026-09-09] `db_password = "password"` has a key with another component, so the
     # rule below reads it as a label — and it is the single commonest real weak credential there is.
@@ -1443,6 +1679,104 @@ def _is_only_a_template(value):
     return bool(re.fullmatch(r"\$?\{\{?[^{}]*\}\}?", stripped))
 
 
+# 🐛 [2026-09-13] A Kubernetes Secret says what its values are structurally, but every
+# credential rule above asks the KEY to say it again. `data.DATABASE_URL`, `data.DSN`,
+# `data.CONNECTION_STRING` and `data.KUBECONFIG` therefore carried their base64 payloads through
+# untouched: none of those names contains password/secret/key/token/cred. R7 found the first in an
+# external 800-file corpus; R12.36 selected it because a known Secret value surviving `scrub` is a
+# defect, not a masking-policy experiment.
+#
+# Parse only the small YAML fact needed here: a top-level `kind: Secret`, then the block-form direct
+# mapping under either Kubernetes value field. This is deliberately not a general YAML parser. The
+# document boundary and indentation checks keep a ConfigMap, a nested example and an ordinary
+# `data:` mapping out; the field tuple is shared with check 114, which exercises every member.
+_KUBERNETES_SECRET_VALUE_FIELDS = ("data", "stringData")
+_YAML_DOCUMENT_BOUNDARY = re.compile(r"^(?:---|\.\.\.)(?:[ \t]+#.*)?[ \t]*$")
+_KUBERNETES_SECRET_KIND = re.compile(
+    r"^kind[ \t]*:[ \t]*(['\"]?)Secret\1[ \t]*(?:#.*)?$")
+_KUBERNETES_SECRET_FIELD = re.compile(
+    r"^(?:" + "|".join(_KUBERNETES_SECRET_VALUE_FIELDS) + r")[ \t]*:[ \t]*(?:#.*)?$")
+_YAML_MAPPING_VALUE = re.compile(
+    r"^([ \t]+(?:['\"][^'\"\n]+['\"]|[^:#\n][^:\n]*?)[ \t]*:[ \t]*)(.*?)(\r?\n?)$")
+
+
+def _redacted_yaml_scalar(value):
+    """A YAML scalar replaced while its quote style and trailing comment remain readable."""
+    if not value.strip() or value.lstrip().startswith("#"):
+        return None
+    leading = value[:len(value) - len(value.lstrip())]
+    trailing = value[len(value.rstrip()):]
+    body = value.strip()
+    if body[:1] in "'\"":
+        quote = body[0]
+        close = body.rfind(quote)
+        if close > 0 and (not body[close + 1:].strip()
+                          or body[close + 1:].lstrip().startswith("#")):
+            return leading + quote + PLACEHOLDER + quote + body[close + 1:] + trailing
+    comment = re.search(r"[ \t]+#", body)
+    suffix = body[comment.start():] if comment else ""
+    return leading + PLACEHOLDER + suffix + trailing
+
+
+def _redact_kubernetes_secret_data(text):
+    """Redact block-form `data`/`stringData` values in a YAML Kubernetes Secret."""
+    lines = text.splitlines(keepends=True)
+    if not lines:
+        return text
+    starts = [0]
+    for n, line in enumerate(lines):
+        if n and _YAML_DOCUMENT_BOUNDARY.match(line.rstrip("\r\n")):
+            starts.append(n)
+    starts.append(len(lines))
+    out = list(lines)
+    for first, end in zip(starts, starts[1:]):
+        bodies = [line.rstrip("\r\n") for line in lines[first:end]]
+        if not any(_KUBERNETES_SECRET_KIND.match(body) for body in bodies):
+            continue
+        i = first
+        while i < end:
+            body = lines[i].rstrip("\r\n")
+            if not _KUBERNETES_SECRET_FIELD.match(body):
+                i += 1
+                continue
+            i += 1
+            while i < end:
+                child = lines[i]
+                child_body = child.rstrip("\r\n")
+                if not child_body.strip() or child_body.lstrip().startswith("#"):
+                    i += 1
+                    continue
+                indent = len(child_body) - len(child_body.lstrip(" \t"))
+                if indent == 0:
+                    break
+                match = _YAML_MAPPING_VALUE.match(child)
+                if not match:
+                    i += 1
+                    continue
+                replacement = _redacted_yaml_scalar(match.group(2))
+                if replacement is None:
+                    i += 1
+                    continue
+                block_scalar = match.group(2).lstrip().startswith(("|", ">"))
+                out[i] = (match.group(1) + match.group(2) + match.group(3) if block_scalar
+                          else match.group(1) + replacement + match.group(3))
+                i += 1
+                if block_scalar:
+                    while i < end:
+                        continuation = lines[i]
+                        continuation_body = continuation.rstrip("\r\n")
+                        continuation_indent = (
+                            len(continuation_body) - len(continuation_body.lstrip(" \t")))
+                        if continuation_body.strip() and continuation_indent <= indent:
+                            break
+                        if continuation_body.strip():
+                            newline = continuation[len(continuation.rstrip("\r\n")):]
+                            out[i] = continuation_body[:continuation_indent] + PLACEHOLDER + newline
+                        i += 1
+            continue
+    return "".join(out)
+
+
 # \U0001f41b [2026-09-09] `SECRET_WORDS` is a plain ASCII alternation, so ONE non-Latin look-alike
 # in a key turned every rule anchored on it off at once — assignment, bare, call, YAML, rocket,
 # flag and list together. Reproduced: Cyrillic U+0430 for the `a` in `password` and the value left
@@ -1499,6 +1833,7 @@ def scrub(text, windowed=True):
     """
     if not text:
         return text
+    text = _redact_kubernetes_secret_data(text)
     for pattern in PATTERNS + LATE_PREFIXES:
         # A pattern with one group keeps everything outside it: "Bearer <REDACTED>" stays readable
         # as an Authorization header while the credential goes. Groupless patterns replace whole.
@@ -1537,7 +1872,8 @@ def scrub(text, windowed=True):
     # left intact, against six of six real credentials replaced.
     text = COPULA_SECRET.sub(
         lambda m: m.group(0)
-        if (_is_a_plain_word(m.group(2))
+        if (_inside_sql_comment_on(m)
+            or _is_a_plain_word(m.group(2))
             or PLACEHOLDER in m.group(2)
             or m.group(2).lower().rstrip(".,;:") in SCHEME_WORDS
             or _is_only_a_template(m.group(2))
@@ -1609,6 +1945,9 @@ def scrub(text, windowed=True):
         or (m.group(1).rstrip().endswith(":")
             and (_is_a_type_annotation(m) or _declares_a_type(m)))
         or _value_is_the_key_itself(_full_key_at(m), m.group(2))
+        or _is_local_key_derivation(m)
+        or _is_documented_field_name(m)
+        or _is_documented_prose(m)
         or _is_a_template_under_a_weak_name(m.group(1), m.group(2))
         else f"{m.group(1)}{_redact_literals_in(m.group(2)) or PLACEHOLDER}"
         + " " * 0, chunk)
@@ -1931,6 +2270,21 @@ _IBAN = re.compile(r"(?i)(?<![A-Za-z0-9])("
 # `_SEP` is the shared set and this is the FOURTH rule in this file found spelling its own
 # copy of it; the gate above was the third, fixed this morning. The grouping is still
 # required, so the bare 11-digit run stays unmatched for the reason below.
+# \U0001f41b [2026-09-11] CPF had the dotted form and nothing else, while RRN beside it carries
+# DASHED, BARE and a WORD gate, and Aadhaar carries its pattern and a WORD gate. So a valid CPF
+# written as eleven plain digits was unredacted even under an explicit `cpf =` label — the module's
+# own validator returned True for it and no rule ever asked. Two of three keyword-gated schemes had
+# the keyword path and the third did not, in the block whose comment eight lines down already
+# records being bitten by exactly this on 2026-09-08 (R2 agent26, which reported the corpus gap that
+# hid it: four of six schemes have no case at all, so the published recall figure never fires them).
+#
+# Gated on the word for the reason the siblings give in full: roughly one in eleven random 11-digit
+# runs passes mod 11, and an order id or a timestamp is eleven digits often enough that shape alone
+# would be a guess. The word is what makes it a finding. Brazil spells it out as well as abbreviates.
+_CPF_BARE = re.compile(r"(?<![0-9A-Za-z_-])([0-9]{11})(?![0-9A-Za-z_-])")
+_CPF_WORD = re.compile(
+    r"(?i)(?<![a-z])(cpf|cadastro[_ -]?de[_ -]?pessoas[_ -]?f[i\u00ed]sicas"
+    r"|cadastro[_ -]?pessoa[_ -]?f[i\u00ed]sica)(?![a-z])")
 _CPF_DOTTED = re.compile(r"(?<![0-9])([0-9]{3}" + _SEP + r"[0-9]{3}" + _SEP
                          + r"[0-9]{3}" + _SEP + r"[0-9]{2})(?![0-9])")
 _AADHAAR = re.compile(r"(?<![0-9])([0-9]{4}" + _SEP + r"?[0-9]{4}" + _SEP + r"?[0-9]{4})(?![0-9])")
@@ -2050,7 +2404,16 @@ def _thai_national_id(digits):
 # there was no long digit run and returned the text untouched. Two lists that must agree is
 # the defect this file already warns about two hundred lines up, in its own words, about a
 # different pair. Built from `_SEP` now, so there is one list.
-_A_LONG_DIGIT_RUN = re.compile(r"[0-9](?:[0-9]|" + _SEP + r"){10,}[0-9]")
+# \U0001f41b [2026-09-11] `{10,}` made the shortest run this gate admits TWELVE characters, and
+# CPF is ELEVEN digits. So every bare CPF was refused by the gate before a single rule ran —
+# which is why only the dotted form ever worked, at fourteen characters. The threshold was
+# right for every other scheme here (card 12-19, Aadhaar 12, RRN 13, Thai 13, IBAN 15 and up)
+# and the one member below the line was the one nobody checked it against. Derived from the
+# schemes now rather than written as a number: the gate admits the shortest identifier any
+# rule below it can match, so adding a shorter scheme moves this by arriving.
+SHORTEST_IDENTIFIER = 11        # CPF. Nothing this layer matches is shorter.
+_A_LONG_DIGIT_RUN = re.compile(
+    r"[0-9](?:[0-9]|" + _SEP + r"){%d,}[0-9]" % (SHORTEST_IDENTIFIER - 2))
 
 
 # The delimiters a real export uses. `|` is here for the markdown table form, which is how a
@@ -2099,13 +2462,14 @@ _HEADER_BARE = (
     # `ansible_ssh_pass` column cannot be taken back.
     r"password|passwd|pwd|passphrase|secret|token|api[_ -]?key|apikey|key|auth"
     r"|[A-Za-z0-9]+[_ -]pass"
-    # Spanish, Portuguese, French, German, Italian, Dutch, Polish, Turkish, Vietnamese, Indonesian
-    r"|contrase[ñn]a|clave|senha|palavra[_ -]?passe|mot[_ -]?de[_ -]?passe|motdepasse"
-    r"|kennwort|passwort|geheimnis|parola|segreto|wachtwoord|geheim"
-    r"|has[lł]o|[şs]ifre|parola[_ -]?chiave|m[aậ]t[_ -]?kh[aẩ]u|matkhau|kata[_ -]?sandi"
-    # Thai, Chinese, Japanese, Korean, Russian
-    r"|รหัสผ่าน|รหัส|密码|密碼|口令|秘密|パスワード|暗証番号|비밀번호|암호"
-    r"|пароль|секрет|ключ"
+    # The same non-English credential words the assignment path uses (`_NONENGLISH_SECRET_WORDS`,
+    # defined once, near `SECRET_WORDS`, above) -- this used to be a second, hand-typed copy of the
+    # same list, and reconciling the two found they had already drifted: this header-only line kept
+    # `parola[_ -]?chiave` (Italian "keyword"), which is a header-naming convention rather than a
+    # translation of "password" and so stays a header-only addition rather than joining the shared
+    # list.
+    r"|" + _NONENGLISH_SECRET_WORDS +
+    r"|parola[_ -]?chiave"
     r"|credential|credentials|cred|creds|storepass|keypass"
     r"|private[_ -]?key|access[_ -]?key|secret[_ -]?key"
     r"|card|card[_ -]?number|pan|iban|cpf|aadhaar|aadhar|uidai|uid"
@@ -2155,6 +2519,8 @@ _HEADER_LANGS = {
     "Japanese": ("パスワード", "暗証番号"),
     "Korean": ("비밀번호", "암호"),
     "Russian": ("пароль", "секрет", "ключ"),
+    "Arabic": ("كلمة المرور", "كلمة_المرور"),
+    "Hindi": ("पासवर्ड",),
 }
 
 _HEADER_WORD = re.compile(
@@ -2425,6 +2791,9 @@ def _redact_personal_data(text):
         # forgotten in the identical ones beside it this repository's recurring defect.
         spans += [m.span(1) for m in _IBAN.finditer(folded) if _iban(m.group(1))]
         spans += [m.span(1) for m in _CPF_DOTTED.finditer(folded) if _cpf(m.group(1))]
+        # ...and the bare eleven digits, behind the word, in the same shape as the two rules below.
+        if _CPF_WORD.search(context):
+            spans += [m.span(1) for m in _CPF_BARE.finditer(folded) if _cpf(m.group(1))]
         # Korea, gated for the same reason Aadhaar is and in the same shape: one in ten random runs
         # passes the checksum, so the keyword is what makes this a finding rather than a guess.
         if _RRN_WORD.search(context):
