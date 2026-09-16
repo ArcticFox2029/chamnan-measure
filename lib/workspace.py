@@ -17,6 +17,86 @@ import os
 import sys
 from pathlib import Path
 
+# \U0001f41b [2026-09-15] R6.7. On Windows, CreateProcess searches the CURRENT DIRECTORY before PATH,
+# and the current directory is the repository the user just opened. This package runs
+# `subprocess.run(["git", ...])` twenty-six times, so a cloned repository carrying `git.exe` at its
+# root would have that binary executed by the SessionStart hook — arbitrary code from cloning, which
+# is the class this package exists to warn people about.
+#
+# Microsoft's documented switch removes the current directory from that search, and children inherit
+# it, so one line covers every call site including the ones written later.
+#
+# **The alternative was worse, and it took two other models to settle it.** Resolving `git` to an
+# absolute path with `shutil.which` also closes this — and it opens what check 150 already forbids:
+# from Python 3.12 `which` changed on Windows, so the same PATH can select a DIFFERENT executable on
+# two supported interpreters with no error. Asked to choose, an independent Mistral and an
+# independent Gemini both picked this one, unprompted and for the same reason: it fixes the hole at
+# the OS rather than adding a resolution whose answer depends on the interpreter. It also leaves
+# argv as a visible literal, which is what makes checks 96 and 124 able to read the promise off the
+# source at all.
+#
+# `setdefault`, not assignment: a caller who has deliberately set it keeps their value, and on
+# every non-Windows platform this is an unread variable costing nothing.
+if sys.platform == "win32":
+    os.environ.setdefault("NoDefaultCurrentDirectoryInExePath", "1")
+
+
+# The second layer, because the first one can be silently absent. `NoDefaultCurrentDirectoryInExePath`
+# is not honoured before Windows 10 1809, and nothing in the process can observe whether it took
+# effect — so on the versions where it does nothing, the hole is exactly as open as before and no
+# error says so.
+#
+# This is the case the switch is FOR, detected directly: a file named like the program, sitting in
+# the directory that CreateProcess would search first. One `exists()` per name, on Windows only,
+# answered from the repository root the caller already has.
+#
+# It REFUSES rather than working around it. A plausible `git.exe` in a repository root is not a
+# configuration mistake to route around — nobody puts one there by accident — and a tool that
+# quietly picked the right binary would leave the next tool on that machine to find the wrong one.
+_WINDOWS_PROGRAM_SUFFIXES = (".exe", ".com", ".bat", ".cmd")
+
+
+def a_program_is_lying_in_wait(root, names=("git",)):
+    """Names in `root` that Windows would run instead of the program on PATH. Empty elsewhere.
+
+    Returns a list so the caller can name every one of them; an empty list on any platform that
+    does not search the current directory, which is every platform except Windows.
+    """
+    if sys.platform != "win32":
+        return []
+    found = []
+    for name in names:
+        for suffix in _WINDOWS_PROGRAM_SUFFIXES:
+            candidate = Path(root) / (name + suffix)
+            try:
+                if candidate.is_file():
+                    found.append(candidate.name)
+            except OSError:
+                continue
+    return found
+
+# A read-only git command can reach the NETWORK, and one of ours runs inside a hook.
+#
+# Git's partial-clone design makes ordinary object lookup fall back to a `git fetch` subprocess when
+# a promised blob is missing, and that fetch may require authentication (R14.9, git's own
+# partial-clone documentation). So `git diff` from `chamnan_session_start` — a hook, on somebody
+# else's machine, while they are waiting for a session to open — can open a network round trip and
+# an auth prompt, from a command whose whole purpose here is to observe.
+#
+# Set once, here, rather than at the call sites. Derived from the tree rather than taken from the
+# report that raised it: of 22 `git` invocations in the shipped code, THREE can demand blob content
+# -- `bin/chamnan-guard` (`diff --cached`), `hooks/chamnan_session_start.py` (`diff --quiet`) and
+# `lib/timeline.py` (`log --follow --name-only`, which diffs to detect renames). The report named
+# two and neither was `chamnan-guard`; it named `lib/rollup.py`, whose call is `rev-list` and needs
+# no blob. Three edits would also have left the fourth caller to be forgotten, which is this
+# repository's most recorded defect. Every command entry point imports this module, so one line
+# covers all of them and every future one.
+#
+# `setdefault`, not assignment: a user who has set it deliberately keeps their value. The remaining
+# 19 calls are metadata-only (`rev-parse`, `status`, `ls-files`, `check-ignore`, `config`,
+# `rev-list`) and have nothing to fetch, so this costs them nothing.
+os.environ.setdefault("GIT_NO_LAZY_FETCH", "1")
+
 WORKSPACE_DIRNAME = ".chamnan"
 # Each part can be switched off independently. Nothing here is load-bearing for the others: turning
 # `map` off leaves state and skills working, and vice versa. That is deliberate — the parts have
@@ -56,9 +136,37 @@ DEFAULT_CONFIG = {
     # budgets above have already had their say. The two are not the same measurement and cannot
     # substitute for each other: the host truncates a hook's stdout over 10,000 bytes to its first
     # 2,048 plus a path on disk, and that cut is positional, so a block can be comfortably inside
-    # every token budget and still lose its whole second half. 9,000 leaves margin under a limit
-    # that is not ours to change. Set 0 to switch the ceiling off and take the host's cut instead.
-    "output_byte_ceiling": 9000,
+    # every token budget and still lose its whole second half. Set 0 to switch the ceiling off and
+    # take the host's cut instead.
+    #
+    # 🐛 [2026-09-14] This shipped at 9,000 while `_UPPER_BOUND` — the most a config may ask for,
+    # sized against the host's own positional cut — has been 9,500 since it was written. Two
+    # numbers for the same limit, and the default was the smaller of them, so every workspace that
+    # never touched its config gave back 500 bytes it was allowed to use.
+    #
+    # Measured on this repository before changing it: at 9,000 the block delivers **5 sections**
+    # and at 9,500 it delivers **7**, for 483 more bytes — about 216 tokens.
+    #
+    # 🐛 [2026-09-15] That prediction named the wrong two sections, and the correction is the more
+    # interesting number. Measured over all 400 recorded firings, split by the ceiling in force:
+    # what 9,500 actually buys is `Recorded decisions and lessons` **15% → 100%** and `Where the
+    # last session stopped` **34% → 100%** — 14 of 25 memory entries and the last session's own
+    # stopping point, arriving every time instead of one session in six. `Recent milestones` went
+    # slightly DOWN (60% → 53%), and `This repo's own tools` gained nothing: it is still dropped
+    # **100% of the time**, as it has been in all 400 firings at either ceiling. It sits at
+    # position 1 in `fit.DROP_ORDER` and costs roughly 1,386 bytes, which has never once been
+    # available. The raise is worth more than was claimed for it, for different reasons than were
+    # claimed — and a number inside the comment that justifies a shipped default is exactly what
+    # check 44 exists to stop being wrong, one layer out.
+    #
+    # **This is a CAP and not a target, which is the reason it is safe to raise.** A block is built
+    # from what the workspace actually holds and then shrunk to fit; raising the cap charges nobody
+    # who does not reach it. Measured the same afternoon: chamnan's own repository emits 4,180
+    # bytes against the identical ceiling, and a workspace with two files emits about 1,300.
+    #
+    # The owner's wording, 2026-09-14: *"ตั้งเป็นค่ามาตรฐานไปก่อน 9500 แต่คุมว่าเฉพาะใช้งานจริง ไม่ใช่ค่าตายตัว
+    # ใครใช้ไม่ถึงก็คิดตามจริง"*.
+    "output_byte_ceiling": 9500,
     # The rules section's own budget, in characters. It had none until 2026-09-09 and was fixed at
     # 1,500 from a day when this repository had one rule; the two sections beside it in the block
     # have had a dial all along.
@@ -950,6 +1058,56 @@ def _warn_if_workspace_escapes(ws, root):
           file=sys.stderr)
 
 
+_WORKTREE_WARNED = set()
+
+
+def _warn_if_workspace_is_in_a_linked_worktree(ws, root):
+    """Say so when this workspace belongs to a linked worktree rather than the main checkout.
+
+    🐛 [2026-09-15] The sibling above covers a `.chamnan` symlink pointing OUT of the repository,
+    and the identical hazard one step over had nothing: a linked worktree gets its own checkout of
+    the committed workspace, so everything reads correctly and everything WRITTEN there is a new
+    untracked file in a directory that may not survive the day.
+
+    Reproduced end to end (AUDIT-9). The Agent tool's `isolation: "worktree"` runs a dispatched
+    agent against exactly this. The agent can read every rule, record what it learned exactly as
+    instructed, and `git worktree remove --force` takes it with no warning — the main checkout
+    never saw it. An agent that learns something and loses it is worse than one that learns
+    nothing, because the session that dispatched it believes the lesson was kept.
+
+    Said, not refused, and deliberately: `ensure()`'s own comment two hundred lines down settles
+    the policy for the adjacent case — *"Someone sharing one workspace across git worktrees has a
+    reason, and this runs on every write path."* Someone working in a worktree on purpose gets a
+    sentence, once per process, not a failure.
+
+    A linked worktree is `.git` as a FILE holding `gitdir: …`; `sessions.py` and `rollup.py`
+    already read it that way and this is the third reader of the same fact.
+    """
+    try:
+        dotgit = Path(root) / ".git"
+        if not dotgit.is_file():
+            return                      # a real checkout, or no git at all
+        pointer = dotgit.read_text(encoding="utf-8", errors="replace").strip()
+    except OSError:
+        return
+    if not pointer.startswith("gitdir:"):
+        return
+    # A submodule's `.git` is a file too, and a submodule is not this problem: its worktree is
+    # permanent and its content is tracked by the submodule's own repository. A linked worktree's
+    # gitdir sits under the parent's `worktrees/` directory, which is what separates the two.
+    if "/worktrees/" not in pointer.replace("\\", "/"):
+        return
+    key = str(root)
+    if key in _WORKTREE_WARNED:
+        return
+    _WORKTREE_WARNED.add(key)
+    print(f"chamnan: {root} is a linked git worktree, so {ws} is its own copy.\n"
+          f"  Reading is fine — it holds everything that was committed. Anything WRITTEN here is\n"
+          f"  untracked in a checkout that `git worktree remove` deletes, and the main checkout\n"
+          f"  never sees it. Commit it, or write it from the main checkout instead.",
+          file=sys.stderr)
+
+
 # A command that has told the user it writes nothing must be able to keep that promise even when
 # what it runs, to answer the question, is the hook that sets the workspace up.
 READ_ONLY_ENV = "CHAMNAN_READ_ONLY"
@@ -1035,6 +1193,9 @@ def ensure(root=None):
     # runs on every write path -- a hard failure there would break a deliberate setup with no way to
     # opt out. Warned once per process instead, because ensure() is called many times per run.
     _warn_if_workspace_escapes(ws, find_root(root))
+    # The same question one step over: not a symlink out of the repository, but a checkout
+    # that is itself temporary. Both are "what you write here is not where you think".
+    _warn_if_workspace_is_in_a_linked_worktree(ws, find_root(root))
     # 🐛 `state` was missing from this list, and it is the directory CLAUDE.md calls "what the
     # tooling READS". `notice_due()` writes its counter there through `exclusive()`, whose lock file
     # cannot be created when the parent does not exist — so the lock was never held, the function
@@ -1512,13 +1673,16 @@ def _shipped_content_hash(plugin_root):
     installs.py for the same failure shape).
     """
     try:
+        import tree                      # local, and it must be: `tree` imports this module
+
         root = Path(plugin_root)
         files = []
         for sub in _SHIPPED_SUBDIRS:
             base = root / sub
             if not base.is_dir():
                 continue
-            for dirpath, dirnames, filenames in os.walk(base):
+            for dirpath, dirnames, filenames in os.walk(
+                    base, onerror=tree.note_unreadable(base)):
                 dirnames[:] = [d for d in dirnames if d not in _HASH_SKIP_DIRS]
                 for fname in filenames:
                     fpath = Path(dirpath) / fname
@@ -2443,7 +2607,13 @@ def wants_version(argv):
 
 
 def nonce_for(session_id):
-    """A fence marker constant for one session and unguessable from inside the repository.
+    """A DUMMY SECRET: a fence marker, constant for one session, unguessable from inside the repo.
+
+    Called a dummy secret rather than a nonce because that is what it has to behave like. It keeps
+    nothing safe by itself and it is printed in full in every block — its whole job is that a file
+    in the repository cannot GUESS it, so that file cannot close the fence early and continue in
+    the voice of the system. A reader who thinks of it as a formatting detail will eventually make
+    it predictable; a reader who thinks of it as a secret will not.
 
     🐛 `secrets.token_hex` used to be called at import, which made the marker per INVOCATION rather
     than per session — the thing its own comment said it was. The hook re-runs on every resume and
@@ -2801,6 +2971,65 @@ def git_folds_case(root):
         # git failure comes to differ between two callers — the suite refuses it for that reason.
         return False
     return r.stdout.strip().lower() == "true"
+
+
+def unrebuildable_workspace_files(root):
+    """The workspace files a rebuild cannot bring back — what is lost if `.chamnan/` is never committed.
+
+    Derived from what WRITES each directory, not from a list of paths. `MAP.md` is regenerated from
+    the tree, the citation index is regenerated by its tool, and `logs/` is gitignored on purpose;
+    none of the three is in here. What is in here is what a person or a session typed and nothing
+    can reproduce: memory (rules, records, decisions, threads) and skills.
+
+    Returns paths rather than a count so a caller can say WHICH, and so a test can assert the
+    population instead of a number that drifts.
+    """
+    ws = Path(root) / WORKSPACE_DIRNAME
+    if not ws.is_dir():
+        return []
+    out = []
+    for name in ("memory", "skills"):
+        d = ws / name
+        if not d.is_dir():
+            continue
+        try:
+            for p in sorted(d.rglob("*.md")):
+                if p.is_file():
+                    out.append(p)
+        except OSError:
+            # A directory that cannot be read is not an empty one. Saying nothing here would make
+            # "nothing to lose" and "I could not look" the same answer, which is the shape this
+            # repository has recorded more than any other.
+            return out or [d]
+    return out
+
+
+def workspace_is_tracked(root):
+    """True when git already has at least one file under `.chamnan/` in its index.
+
+    `git ls-files` and not a filesystem test, because tracked is a question about the INDEX: a file
+    can exist on disk and be untracked, and under a sparse checkout it can be tracked and absent.
+    One path-scoped call, `--` so a directory named like an option cannot be read as one.
+    """
+    # \U0001f41b [2026-09-14] The first version of this function broke three conventions at once and
+    # the suite named all three: it ran `git -C <root>` without first asking whether git can speak
+    # for that directory (a bare `git -C` inside a non-repository answers about whatever repository
+    # sits ABOVE it -- the wrong tree, confidently), and it spelled its own failure tuple instead of
+    # using the one definition. `read-the-nearest-sibling-all-the-way-through` in one function.
+    if not git_can_speak_for(root):
+        return True
+    # Deferred, as everywhere else in this module: the import costs ~9 ms and every command pays it
+    # at load whether or not it ever asks git anything.
+    import subprocess
+    try:
+        out = subprocess.run(["git", "-C", str(root), "ls-files", "--", WORKSPACE_DIRNAME],
+                             capture_output=True, text=True, encoding="utf-8",
+                             errors="replace", stdin=subprocess.DEVNULL, timeout=10)
+    except git_cannot_answer():
+        # Cannot tell. Claim it IS tracked, so an unanswerable question never produces advice the
+        # user does not need -- the quiet failure is the acceptable one here.
+        return True
+    return out.returncode == 0 and bool(out.stdout.strip())
 
 
 def git_can_speak_for(root):

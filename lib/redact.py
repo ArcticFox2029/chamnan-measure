@@ -16,8 +16,50 @@ recoverable; an unusable map means the tool gets uninstalled and nothing is prot
 """
 import os
 import re
+import binascii as _binascii
+from base64 import b64decode as _b64decode
 import unicodedata
 from pathlib import Path
+
+class _Lazy:
+    """A compiled pattern that is not compiled until something asks it to work.
+
+    Sixty patterns are bound at this module's top level and compiling them costs 147 ms of the
+    154 ms it takes to import — measured 2026-09-14, and paid by all thirteen commands because
+    every one of them scrubs its own output before printing it. A representative scrub touches 34
+    of the 68; the other 34 were compiled for nothing on every single invocation.
+
+    A module-level `__getattr__` (PEP 562) would be cleaner and does not work here: it fires for
+    `redact.NAME` from outside and NOT for a bare `NAME` inside this file, which is how most of
+    these are used. So the laziness lives in the object.
+
+    Everything is forwarded, so `.search`, `.sub`, `.finditer` and `.pattern` behave as before; the
+    only observable difference is WHEN the compile happens. `re.Pattern` is not subclassable, which
+    is why this is a proxy rather than an override.
+    """
+
+    __slots__ = ("_make", "_real")
+
+    def __init__(self, make):
+        self._make = make
+        self._real = None
+
+    def _compiled(self):
+        real = self._real
+        if real is None:
+            real = self._real = self._make()
+        return real
+
+    def __getattr__(self, item):
+        return getattr(self._compiled(), item)
+
+    def __repr__(self):
+        return "<lazy %r>" % (self._compiled().pattern[:60],)
+
+
+def _lazy(make):
+    return _Lazy(make)
+
 
 PLACEHOLDER = "<REDACTED>"
 
@@ -55,8 +97,8 @@ PLACEHOLDER = "<REDACTED>"
 # `sk-proj-abcd1234`, `hunter2-hunter2` and `abc-def-ghi-jkl-mno` out: a credential is not two or
 # three all-alphabetic English words joined by hyphens. Checked against every word the one-word
 # version accepted -- same answer on all of them.
-_PLAIN_WORD = re.compile(
-    "^[A-Za-z][a-z]{1,17}(?:-[A-Za-z][a-z]{1,17}){0,3}[.,;:!?)\\]\u2026\"'`]*$")
+_PLAIN_WORD = _lazy(lambda: re.compile(
+    "^[A-Za-z][a-z]{1,17}(?:-[A-Za-z][a-z]{1,17}){0,3}[.,;:!?)\\]\u2026\"'`]*$"))
 
 
 def _is_a_default_credential(value):
@@ -79,7 +121,11 @@ def _is_a_plain_word(value):
     with `(`, and the assignment rules still cover `password = {...}` if one ever did.
     """
     value = value or ""
-    if bool(_PLAIN_WORD.match(value)) or value[:1] in "([{":
+    # 🐛 [2026-09-15] `<` was missing from this list, and `<your-password-here>` is the commonest
+    # placeholder shape there is — every README, every `.env.example`. Fixed in the shared helper
+    # rather than in the rule that found it, because all five assignment rules ask this same
+    # question and `password = <redacted>` was being redacted by every one of them.
+    if bool(_PLAIN_WORD.match(value)) or value[:1] in "([{<":
         return True
     # 🐛 [2026-09-13] R12.26: the prose guard was ASCII-only, so an ordinary translated word
     # beside a credential label was treated as the value itself. The R7 external corpus caught
@@ -92,6 +138,46 @@ def _is_a_plain_word(value):
             and all(2 <= len(part) <= 18
                     and all(unicodedata.category(char)[:1] in ("L", "M") for char in part)
                     for part in parts))
+
+
+_ONLY_STRUCTURE = re.compile(r"[}\]\s,;]*")
+
+
+def _structure_the_value_did_not_open(match, value):
+    """The trailing part of `value` that CLOSES a bracket opened before the name, or "".
+
+    🐛 [2026-09-15] Found by R5.3's idempotence relation over a real corpus -- `scrub(scrub(x)) !=
+    scrub(x)` on one file of 1,187, because the first pass left something the second could still
+    read. The cause: the rules whose value is one unbroken run of non-space take that run to the
+    end of the line, and inside an object literal the run includes the `}` that closes the object.
+
+        body: {kind: 'certificate_of_origin', storage_key: storageKeyOfUpload},
+        body: {kind: 'certificate_of_origin', storage_key: <REDACTED>
+
+    The brace and the comma are gone, so the line no longer parses and a reader cannot see what
+    shape it had -- the damage this module names elsewhere as the thing it must not do to the index
+    it exists to write. The QUOTED rule never had it, because a quote is a boundary the pattern
+    already respects; the four rules whose value is a bare run had it together, which is why this
+    is a helper rather than an edit at the one site that surfaced.
+
+    Deliberately conservative in the leak direction: the tail is given back ONLY when everything
+    from that point on is closers, commas, semicolons and space. `password=abc}def` still goes
+    whole, because `}def` may be the rest of a credential rather than the rest of a line.
+    """
+    prefix = match.string[match.string.rfind("\n", 0, match.start()) + 1:match.start()]
+    if not (prefix.count("{") > prefix.count("}") or prefix.count("[") > prefix.count("]")):
+        return ""
+    depth = 0
+    for i, ch in enumerate(value):
+        if ch in "{[":
+            depth += 1
+        elif ch in "}]":
+            if depth:
+                depth -= 1
+                continue
+            tail = value[i:]
+            return tail if _ONLY_STRUCTURE.fullmatch(tail) else ""
+    return ""
 
 
 def _is_a_type_annotation(match):
@@ -127,10 +213,10 @@ def _is_a_type_annotation(match):
 # How far back a declaration keyword may sit from the name it declares. `public static readonly`
 # is 24 characters; 48 clears every modifier stack these languages allow and nothing more.
 _DECLARATION_REACH = 48
-_DECLARATION_KEYWORD = re.compile(
+_DECLARATION_KEYWORD = _lazy(lambda: re.compile(
     r"(?:^|[^\w.])(?:let|var|const|val|readonly|declare|public|private|protected|internal"
     r"|static|final|interface|type|struct|class|enum|record|protocol|extension"
-    r"|func|fn|def|fun|sub|property)\s", re.I)
+    r"|func|fn|def|fun|sub|property)\s", re.I))
 
 # The primitive type names, which are what a field declaration inside a braced block ends up
 # holding once the declaring keyword is a line or more above it:
@@ -141,10 +227,10 @@ _DECLARATION_KEYWORD = re.compile(
 #
 # Bounded to a closed list rather than a shape, because a shape is what the first version of the
 # function above tried and it was wrong in both directions.
-_PRIMITIVE_TYPE = re.compile(
+_PRIMITIVE_TYPE = _lazy(lambda: re.compile(
     r"^(?:string|str|int|integer|number|num|float|double|decimal|bool|boolean|byte|bytes"
     r"|char|long|short|any|unknown|never|void|null|nil|none|object|date|datetime|uuid|guid"
-    r"|list|dict|map|array|set|tuple|error|time|duration|interface\{\})!?[;,)\]}]*$", re.I)
+    r"|list|dict|map|array|set|tuple|error|time|duration|interface\{\})!?[;,)\]}]*$", re.I))
 
 # A dotted run of identifier components with at least one capitalised: `P256.Signing.PrivateKey`,
 # `System.Security.Cryptography.RSA`. Swift, C# and Java spell a fully-qualified type this way, and
@@ -196,18 +282,18 @@ def _declares_a_type(match):
 
 # `Authorization: Bearer <jwt>` and `Basic <base64>` — but "Basic Authentication" is a phrase, and
 # this rule matched it for years because twelve letters is twelve characters.
-AUTH_SCHEME_SECRET = re.compile(
-    r"(?<![A-Za-z0-9_-])(?:Bearer|Basic|Token)\s+([A-Za-z0-9._~+/=-]{12,})")
+AUTH_SCHEME_SECRET = _lazy(lambda: re.compile(
+    r"(?<![A-Za-z0-9_-])(?:Bearer|Basic|Token)\s+([A-Za-z0-9._~+/=-]{12,})"))
 
 PATTERNS = [
     # Provider tokens with unambiguous prefixes — no false positives worth worrying about.
-    re.compile(r"(?<![A-Za-z0-9_-])sk-(?:proj-|ant-)?[A-Za-z0-9_-]{16,}"),
-    re.compile(r"(?<![A-Za-z0-9_-])(?:gh[pousr]_|github_pat_)[A-Za-z0-9_]{16,}"),
+    re.compile(r"(?<![A-Za-z0-9])sk-(?:proj-|ant-)?[A-Za-z0-9_-]{16,}"),
+    re.compile(r"(?<![A-Za-z0-9])(?:gh[pousr]_|github_pat_)[A-Za-z0-9_]{16,}"),
     # 🐛 [2026-09-08] `xoxe-` and `xoxe.` are Slack's rotation-era refresh and access
     # tokens, introduced 2021, and neither matched `xox[baprs]-` -- so a rotated token
     # leaked in full with the word "token" on the same line (R2 agent 2).
-    re.compile(r"(?<![A-Za-z0-9_-])xox[baprse]-[A-Za-z0-9-]{10,}"),
-    re.compile(r"(?<![A-Za-z0-9_-])xoxe\.xox[bp]-[A-Za-z0-9.-]{10,}"),
+    re.compile(r"(?<![A-Za-z0-9])xox[baprse]-[A-Za-z0-9-]{10,}"),
+    re.compile(r"(?<![A-Za-z0-9])xoxe\.xox[bp]-[A-Za-z0-9.-]{10,}"),
     # \U0001f41b [2026-09-09] Six vendor prefixes that this module NAMES in `_CREDENTIAL_PREFIX` and
     # never enforced anywhere. Measured with each vendor's documented body length and charset,
     # computed rather than typed: a Google OAuth token, a DigitalOcean personal token, a Shopify
@@ -226,10 +312,10 @@ PATTERNS = [
     #
     # Dots are in the body for the two that need them — `ya29.` and `SG.` — and nowhere else.
     re.compile(r"(?<![A-Za-z0-9_.-])ya29\.[A-Za-z0-9_.\-]{20,}"),
-    re.compile(r"(?<![A-Za-z0-9_-])dop_v1_[A-Za-z0-9]{32,}"),
-    re.compile(r"(?<![A-Za-z0-9_-])shp(?:at|ca|pa|ss)_[A-Za-z0-9]{24,}"),
-    re.compile(r"(?<![A-Za-z0-9_-])dckr_pat_[A-Za-z0-9_-]{24,}"),
-    re.compile(r"(?<![A-Za-z0-9_-])phc_[A-Za-z0-9]{32,}"),
+    re.compile(r"(?<![A-Za-z0-9])dop_v1_[A-Za-z0-9]{32,}"),
+    re.compile(r"(?<![A-Za-z0-9])shp(?:at|ca|pa|ss)_[A-Za-z0-9]{24,}"),
+    re.compile(r"(?<![A-Za-z0-9])dckr_pat_[A-Za-z0-9_-]{24,}"),
+    re.compile(r"(?<![A-Za-z0-9])phc_[A-Za-z0-9]{32,}"),
     re.compile(r"(?<![A-Za-z0-9_.-])SG\.[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}"),
     # 🐛 `AKIA` alone. AWS issues access key IDs under four prefixes and the commonest one in CI is
     # `ASIA` — the temporary credential every assumed role hands out — which sailed straight through
@@ -240,14 +326,19 @@ PATTERNS = [
     # they are not credentials, and redacting them would cost the index real information for nothing.
     # Two comparable tools redact them anyway; that is the precision half of this module's trade
     # being spent without being noticed.
-    re.compile(r"(?<![A-Za-z0-9_-])(?:AKIA|ASIA|ABIA|ACCA)[0-9A-Z]{16}\b"),
-    re.compile(r"(?<![A-Za-z0-9_-])AIza[0-9A-Za-z_-]{30,}"),
-    re.compile(r"(?<![A-Za-z0-9_-])(?:sk|rk|pk)_(?:live|test)_[A-Za-z0-9]{16,}"),
-    re.compile(r"(?<![A-Za-z0-9_-])glpat-[A-Za-z0-9_-]{16,}"),
-    re.compile(r"(?<![A-Za-z0-9_-])npm_[A-Za-z0-9]{30,}"),
-    re.compile(r"(?<![A-Za-z0-9_-])SG\.[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{16,}"),
-    re.compile(r"(?<![A-Za-z0-9_-])GOCSPX-[A-Za-z0-9_-]{16,}"),
-    re.compile(r"(?<![A-Za-z0-9_-])hf_[A-Za-z0-9]{30,}"),
+    # 🐛 [2026-09-15] `\b` was the right edge, and `_` is a word character, so `AKIA…EXAMPLE_v2`
+    # and `AWS_KEY_AKIA…EXAMPLE_backup` carried a complete, valid 20-character key ID through
+    # untouched. A key ID is exactly 20 characters of its own alphabet: what may not follow it is
+    # MORE of that alphabet, which would make it a longer token — not an underscore, which makes it
+    # a suffixed name around the same key. (R3.1 boundary mutation, found by the right-edge grid.)
+    re.compile(r"(?<![A-Za-z0-9])(?:AKIA|ASIA|ABIA|ACCA)[0-9A-Z]{16}(?![0-9A-Z])"),
+    re.compile(r"(?<![A-Za-z0-9])AIza[0-9A-Za-z_-]{30,}"),
+    re.compile(r"(?<![A-Za-z0-9])(?:sk|rk|pk)_(?:live|test)_[A-Za-z0-9]{16,}"),
+    re.compile(r"(?<![A-Za-z0-9])glpat-[A-Za-z0-9_-]{16,}"),
+    re.compile(r"(?<![A-Za-z0-9])npm_[A-Za-z0-9]{30,}"),
+    re.compile(r"(?<![A-Za-z0-9])SG\.[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{16,}"),
+    re.compile(r"(?<![A-Za-z0-9])GOCSPX-[A-Za-z0-9_-]{16,}"),
+    re.compile(r"(?<![A-Za-z0-9])hf_[A-Za-z0-9]{30,}"),
     # An Authorization header names its scheme and then hands over the credential. Matching this
     # explicitly is not a nicety: the bare-assignment rule below sees "Authorization:" as a secret
     # assignment, captures the word "Bearer" as the value, and replaces THAT -- leaving the token
@@ -262,7 +353,7 @@ PATTERNS = [
     # floor stays on the first two segments, which is what stops `a.b.c` prose from matching; the
     # signature may now be empty, and a trailing dot is required so a two-segment string still is
     # not a token. (R3 agent 2.)
-    re.compile(r"(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]*"
+    re.compile(r"(?<![A-Za-z0-9])eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]*"
                r"(?![A-Za-z0-9_-])"),
     # Private key and certificate blocks.
     # "BLOCK" is not decoration: a PGP secret key is delimited "PRIVATE KEY BLOCK-----", so a
@@ -282,8 +373,8 @@ PATTERNS = [
 # Prefixes added after the original list was written, and two shapes where the secret is not a
 # value at all but a path segment — no `key=` and no `user:pass@` for the other patterns to find.
 LATE_PREFIXES = [
-    re.compile(r"(?<![A-Za-z0-9_-])xapp-[A-Za-z0-9-]{10,}"),                      # Slack app-level, not xox[baprs]-
-    re.compile(r"(?<![A-Za-z0-9_-])pypi-[A-Za-z0-9_-]{20,}"),
+    re.compile(r"(?<![A-Za-z0-9])xapp-[A-Za-z0-9-]{10,}"),                      # Slack app-level, not xox[baprs]-
+    re.compile(r"(?<![A-Za-z0-9])pypi-[A-Za-z0-9_-]{20,}"),
     re.compile(r"https://hooks\.slack\.com/services/[A-Za-z0-9/]{20,}"),
     re.compile(r"https://discord(?:app)?\.com/api/webhooks/\d+/[A-Za-z0-9_-]{20,}"),
     # A signed URL carries its credential in the query string, where no `key=` and no `user:pass@`
@@ -302,9 +393,9 @@ LATE_PREFIXES = [
     # age's is the interesting one: it is the private half of an age keypair, the whole point of
     # which is that it never leaves the machine, and its fixed `AGE-SECRET-KEY-1` prefix makes it
     # the least ambiguous credential shape in this list. R8 agent 9.
-    re.compile(r"(?<![A-Za-z0-9_-])AGE-SECRET-KEY-1[0-9A-Za-z]{50,}"),
-    re.compile(r"(?<![A-Za-z0-9_-])pscale_(?:pw|tkn|oauth)_[A-Za-z0-9_.-]{20,}"),
-    re.compile(r"(?<![A-Za-z0-9_-])dp\.(?:pt|st|ct|sa|scim|audit)\.[A-Za-z0-9_-]{20,}"),
+    re.compile(r"(?<![A-Za-z0-9])AGE-SECRET-KEY-1[0-9A-Za-z]{50,}"),
+    re.compile(r"(?<![A-Za-z0-9])pscale_(?:pw|tkn|oauth)_[A-Za-z0-9_.-]{20,}"),
+    re.compile(r"(?<![A-Za-z0-9])dp\.(?:pt|st|ct|sa|scim|audit)\.[A-Za-z0-9_-]{20,}"),
 ]
 
 # [R8 2026-09-13, closed out] The non-English credential words the ASSIGNMENT path
@@ -334,20 +425,98 @@ LATE_PREFIXES = [
 # compound identifier would join them with `_` or `-`, and a JSON/YAML string key would join them
 # with an ordinary space, so both are accepted here the same way `mot[_ -]?de[_ -]?passe` already
 # accepts either for French.
-_NONENGLISH_SECRET_WORDS_BY_SCRIPT = {
+def _nfd_tolerant(fragment):
+    """Make every composed letter in a regex fragment match its decomposed spelling too.
+
+    Two shapes, because a group is not legal inside a character class:
+
+    * a literal letter outside a class becomes `(?:composed|decomposed)`
+    * a class that CONTAINS a decomposable letter gains a trailing combining-mark run, so
+      `contrase[ñn]a` reads `n` followed by U+0303 as the `ñ` it is
+
+    Regex metacharacters are never alphabetic, so `isalpha()` is exactly the right sieve and no
+    separator, quantifier or group in the table above can be touched by this.
+    """
+    out, i, n = [], 0, len(fragment)
+    while i < n:
+        ch = fragment[i]
+        if ch == "[":
+            end = fragment.index("]", i + 1)
+            cls = fragment[i:end + 1]
+            out.append(cls)
+            if any(len(unicodedata.normalize("NFD", c)) > 1 for c in cls):
+                out.append(r"[\u0300-\u036f]*")
+            i = end + 1
+            continue
+        decomposed = unicodedata.normalize("NFD", ch)
+        if len(decomposed) > 1 and ch.isalpha():
+            out.append("(?:" + re.escape(ch) + "|" + re.escape(decomposed) + ")")
+        else:
+            out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+_NONENGLISH_SECRET_WORDS_SPELLED = {
     "Latin": (
         r"contrase[ñn]a|clave|senha|palavra[_ -]?passe|mot[_ -]?de[_ -]?passe|motdepasse"
         r"|kennwort|passwort|geheimnis|parola|segreto|wachtwoord|geheim"
         r"|has[lł]o|[şs]ifre|m[aậ]t[_ -]?kh[aẩ]u|matkhau|kata[_ -]?sandi"
     ),
-    "Thai": r"รหัสผ่าน|รหัส",
+    # 🐛 [2026-09-15] `รหัส` on its own was here, and it is the ordinary Thai word for CODE, not
+    # for password. English settles this by policy and the policy is visible: `code` is not in
+    # `_LATIN_SECRET_WORDS`, so `product_code: SKU-8842` is untouched. Thai had the opposite, and
+    # because an unspaced script takes a same-script SUFFIX (see `_UNSPACED_SCRIPT_SUFFIXES`, and
+    # it is right to), that one word made every Thai compound beginning with "code" a credential
+    # name: `รหัสสินค้า` (product code), `รหัสอ้างอิง` (order reference), `รหัสนักศึกษา` (student
+    # id), `รหัสพนักงาน` (employee id) all had their values replaced in the map. The suffix rule
+    # multiplies the vocabulary across a whole language, so a word that is one degree too broad in
+    # a spaced script is many degrees too broad in an unspaced one.
+    #
+    # The compounds below are the ones that actually name a credential, and the suffix rule still
+    # reaches their inflections: `รหัสเข้า` covers `รหัสเข้าระบบ` and `รหัสเข้าใช้งาน`. What is
+    # given up is bare `รหัส <value>`, which is exactly what English gives up with bare `code`.
+    # R3.5, which asked whether a no-space script needs dictionary boundaries: it does not need
+    # ICU here -- it needs its vocabulary held to the same standard as every other language's.
+    "Thai": r"รหัสผ่าน|รหัสลับ|รหัสเข้า",
     "CJK": r"密码|密碼|口令|秘密|パスワード|暗証番号",
     "Hangul": r"비밀번호|암호",
     "Cyrillic": r"пароль|секрет|ключ",
     "Arabic": r"كلمة[_ -]?المرور",
     "Devanagari": r"पासवर्ड",
 }
+# 🐛 [2026-09-14] Every word above is spelled in its COMPOSED form, and a regex literal compares
+# code points. Unicode's own normalization FAQ states that canonical-equivalent strings "should
+# always compare as equal", which raw code-point comparison does not do -- so the identical visible
+# text in decomposed form went straight through. Measured over the six words whose NFD differs from
+# what is written above, all six leaked:
+#
+#     contraseña  şifre  mật khẩu  パスワード  비밀번호  암호      NFC redacted, NFD did not
+#
+# This is not a corner case on macOS: HFS+ and APFS store filenames decomposed, Korean and Japanese
+# text arrives decomposed from several real sources, and a `ñ` typed with a dead key on some
+# keyboard layouts is decomposed at the source. Found by R13 (Unicode Consortium, Normalization
+# FAQ); the round reported Spanish, and deriving the population from this table found five more.
+#
+# The fix is on the PATTERN side, never on the text. `scrub` returns the caller's document with
+# values replaced, and normalising the document would rewrite bytes the caller did not ask us to
+# touch -- a redactor may remove a secret, not re-encode a file.
+
+
+# Derived, never spelled twice. `SECRET_WORDS` is assembled from this dict at line ~640 and the
+# header rule reads its "Latin" entry directly at ~622; transforming the join alone left both of
+# those matching the composed form only, which is the-set-not-the-member inside the fix for it.
+_NONENGLISH_SECRET_WORDS_BY_SCRIPT = {
+    _script: _nfd_tolerant(_fragment)
+    for _script, _fragment in _NONENGLISH_SECRET_WORDS_SPELLED.items()
+}
 _NONENGLISH_SECRET_WORDS = "|".join(_NONENGLISH_SECRET_WORDS_BY_SCRIPT.values())
+# The same vocabulary as a flat list of the spellings a person actually types, which is what a
+# check asserting "this word reaches that rule" needs. Derived here so no reader builds it by
+# de-regexing the compiled form, which is what check 111 was doing when the words gained their
+# NFD alternatives and stopped being de-regexable.
+_NONENGLISH_SECRET_WORDS_SPELLED_WORDS = [
+    _w for _frag in _NONENGLISH_SECRET_WORDS_SPELLED.values() for _w in _frag.split("|")]
 
 
 # The names that mean "a credential lives here". Written once and shared by the assignment
@@ -579,7 +748,7 @@ SECRET_WORDS = _secret_words_for_scripts(tuple(_SECRET_WORDS_BY_SCRIPT))
 # A compiled regular expression is not a credential, whatever it is called. `TOKEN_RE`,
 # `TOKEN_LEAK_RE` and `SECRET_PATTERN` are the names a scanner gives its own patterns — including
 # this module's — and they were being redacted out of the index of any repository that has one.
-_NOT_A_CREDENTIAL_NAME = re.compile(
+_NOT_A_CREDENTIAL_NAME = _lazy(lambda: re.compile(
     r"(?:_|\b)(?:re|regex|rx|pattern|patterns|prefix|suffix|header|headers|field|fields|column|"
     r"columns|param|params|arg|args|label|labels|id|ids|name|names|type|types|kind|order|sort|"
     r"index|idx|map|maps|dict|list|set|count|len|size|fn|func|cls|class"
@@ -593,9 +762,9 @@ _NOT_A_CREDENTIAL_NAME = re.compile(
     # variable, not the variable's value -- the whole point of the indirection is that
     # the secret is NOT in the file. Redacting it destroys the one thing the line says
     # and hides nothing. Matches Yelp/detect-secrets#923 (R8 agent 9).
-    r"|env|envvar|environ|variable|var|varname)$", re.I)
+    r"|env|envvar|environ|variable|var|varname)$", re.I))
 
-CREDENTIALED_URL = re.compile(
+CREDENTIALED_URL = _lazy(lambda: re.compile(
     # `*`, not `+`: redis://:password@host and amqp://:pass@host carry no username at
     # all, which is the normal form for both, and a one-or-more group never matched them.
     #
@@ -614,8 +783,13 @@ CREDENTIALED_URL = re.compile(
     #
     # The scheme now admits one nested layer, because `jdbc:postgresql://` and `jdbc:mysql://` are
     # how every JVM connection string is written and the single-scheme form never matched them.
-    r"(?<![A-Za-z0-9_-])([a-zA-Z][a-zA-Z0-9+.-]*(?::[a-zA-Z][a-zA-Z0-9+.-]*)?://[^\s:/@]*)"
-    r":([^\s/]{3,})@(?=[^\s/@]+)")
+    # 🐛 [2026-09-15] The guard excluded `-` and `_`, and a diff hunk begins every removed line
+    # with `-`. A removed connection string in a pasted diff therefore went through whole,
+    # which is the shape a session record or a bug report is most likely to carry one in.
+    # Relaxing it costs nothing: this rule fires only when a `:password@host` follows, so a plain
+    # URL is still untouched no matter what precedes the scheme. (R3.1 boundary mutation.)
+    r"(?<![A-Za-z0-9])([a-zA-Z][a-zA-Z0-9+.-]*(?::[a-zA-Z][a-zA-Z0-9+.-]*)?://[^\s:/@]*)"
+    r":([^\s/]{3,})@(?=[^\s/@]+)"))
 # password = "...", api_key: '...', SECRET_TOKEN="..." — the value goes, the name stays.
 # 🐛 [2026-09-06] What sits immediately after the separator is not always the value. Three shapes
 # put something else there, and the rules below captured THAT and stopped:
@@ -663,9 +837,9 @@ _BETWEEN_NAME_AND_VALUE = (
 # whether this is worth having, and it is measured -- `tools/redactor_recall.py` reports it.
 _TYPE_BEFORE_ASSIGN = r"(?:[ \t]+[A-Za-z_][\w.]*(?:\[[^\]\n]*\])?)?[ \t]*=[ \t]*"
 
-ASSIGNED_SECRET = re.compile(
-    r"((?:" + SECRET_WORDS + r")[\w-]*(?:\s*['\"]?\s*" + _KV_SEP + r"\s*" + _BETWEEN_NAME_AND_VALUE
-    + r"|" + _TYPE_BEFORE_ASSIGN + r"))(['\"])([^'\"]{6,})\2", re.I)
+ASSIGNED_SECRET = _lazy(lambda: re.compile(
+    r"((?:" + SECRET_WORDS + r")[\w-]*(?:\s*(?:['\"]\s*)?" + _KV_SEP + r"\s*" + _BETWEEN_NAME_AND_VALUE
+    + r"|" + _TYPE_BEFORE_ASSIGN + r"))(['\"])([^'\"]{6,})\2", re.I))
 # The same assignment without quotes, which is how every .env and .ini file on earth is written.
 # Requiring quotes meant DATABASE_PASSWORD=tr0ub4dor&3-horse passed through untouched. Bounded to a
 # single unbroken run of characters so a prose comment ("password: ask the platform team") is not
@@ -692,8 +866,8 @@ _BETWEEN_NAME_AND_VALUE_SPACED = (
 # `var apiPassword string = ...`, which has no separator for the rules to find -- was wired into the
 # QUOTED rule and nowhere else, so the identical line with the quotes left off passed through whole.
 # The disease this repository keeps producing, in the one module where it leaks credentials.
-ASSIGNED_SECRET_BARE = re.compile(
-    r"((?:" + SECRET_WORDS + r")[\w-]*(?:\s*['\"]?\s*" + _KV_SEP + r"\s*" + _BETWEEN_NAME_AND_VALUE_SPACED
+ASSIGNED_SECRET_BARE = _lazy(lambda: re.compile(
+    r"((?:" + SECRET_WORDS + r")[\w-]*(?:\s*(?:['\"]\s*)?" + _KV_SEP + r"\s*" + _BETWEEN_NAME_AND_VALUE_SPACED
     + r"|" + _TYPE_BEFORE_ASSIGN + r"))"
     # `(` is excluded from the value class. Without it, `AWS_SECRET = base64.b64decode("QUtJQ...")`
     # had `base64.b64decode(` captured AS the secret and replaced, leaving the real payload beside
@@ -712,7 +886,7 @@ ASSIGNED_SECRET_BARE = re.compile(
     # back as `API_TOKEN=<REDACTED>,Tr0ub4dorENV88`, which is worse than a plain miss because the
     # marker says the line was handled. And a value beginning with one was missed outright:
     # `DB_PASSWORD=#Tr0ub4dorENV99` passed through whole.
-    r"(?!<REDACTED>)(\S{6,})", re.I)
+    r"(?!<REDACTED>)(\S{6,})", re.I))
 # A secret-named assignment whose value is a CALL. What is inside is not knowable from here and the
 # name says it is a credential, so the whole expression goes -- to the end of that line, no further.
 # 🐛 [2026-09-08] Every rule in this file needs a separator: `[:=]`, `=>`, a tag boundary, or the
@@ -731,9 +905,9 @@ ASSIGNED_SECRET_BARE = re.compile(
 _QUALIFIED_SECRET_PHRASE = (
     r"(?<![A-Za-z])(?:api|access|secret|private|public|signing|encryption|master"
     r"|session|refresh|auth|bearer|client|app|service)[ ](?:keys?|tokens?)(?![A-Za-z])")
-COPULA_SECRET = re.compile(
+COPULA_SECRET = _lazy(lambda: re.compile(
     r"((?:" + SECRET_WORDS + r"|" + _QUALIFIED_SECRET_PHRASE + r")[\w-]*\s+(?:is|was)\s+)"
-    r"(\S{6,})", re.I)
+    r"(\S{6,})", re.I))
 
 # A credential written as XML/HTML element text. Maven `settings.xml`, Tomcat `server.xml`, .NET
 # `web.config`, Spring XML and JBoss datasources all put it here, and every assignment rule above
@@ -746,24 +920,51 @@ COPULA_SECRET = re.compile(
 # closes the family (R6, six of six). The component boundaries inside `SECRET_WORDS` still do the
 # discriminating, which is why `<AutoTokenizer>` and `<tokenizerConfig>` stay untouched: `token`
 # there has no separator and no word boundary after it.
-XML_SECRET = re.compile(
+XML_SECRET = _lazy(lambda: re.compile(
     r"(<\s*(?:\w+:)?[\w.-]*?(?:" + SECRET_WORDS + r")[\w.-]*\s*(?:\s[^>]*)?>)"
-    r"([^<>]{4,})(</)", re.I)
+    r"([^<>]{4,})(</)", re.I))
 # The hash rocket. After `[:=]` matches the `=`, `\s*` cannot cross the `>` — so the quoted rule
 # found no quote and the bare rule captured `>` alone and failed its six-character floor. This is
 # how `config/database.php` is written in every Laravel app and every Rails `.rb` config.
-ROCKET_SECRET = re.compile(
-    r"((?:" + SECRET_WORDS + r")[\w-]*['\"]?\s*=>\s*)(['\"])([^'\"]{4,})\2", re.I)
+ROCKET_SECRET = _lazy(lambda: re.compile(
+    r"((?:" + SECRET_WORDS + r")[\w-]*['\"]?\s*=>\s*)(['\"])([^'\"]{4,})\2", re.I))
 # A YAML block scalar puts `|` or `>-` where the value would be and the value on the next line, so
 # there was nothing on the key's own line to capture. Helm values.yaml is full of them.
-_YAML_BLOCK_OPENER = re.compile(r":\s*[|>][-+]?[ \t]*\n")
-YAML_BLOCK_SECRET = re.compile(
-    r"((?:" + SECRET_WORDS + r")[\w-]*\s*:\s*[|>][-+]?[ \t]*\n)((?:[ \t]+\S.*\n?)+)", re.I)
+# 🐛 [2026-09-15] The header was `[|>][-+]?` -- the chomping indicator only. YAML also allows an
+# explicit INDENTATION indicator, `|2` / `>3`, and either order with chomping (`|2-`, `|-2`). That
+# is not an exotic corner: it is how a Kubernetes manifest or an Ansible task writes a block whose
+# first line is itself indented. `password: |2` carried its value out in the clear while
+# `password: |` did not. Both the gate and the rule spell this header, and both had to learn it --
+# a gate that skips is as silent as a rule that misses. (R3.3 multiline structured scalars.)
+_YAML_BLOCK_OPENER = re.compile(r":\s*[|>](?:[1-9][-+]?|[-+][1-9]?)?[ \t]*\n")
+YAML_BLOCK_SECRET = _lazy(lambda: re.compile(
+    r"((?:" + SECRET_WORDS + r")[\w-]*\s*:\s*[|>](?:[1-9][-+]?|[-+][1-9]?)?[ \t]*\n)((?:[ \t]+\S.*\n?)+)", re.I))
 # Space-separated forms with no `[:=]` at all: Dockerfile's legacy `ENV KEY VALUE`, `.netrc`, and
 # `.pgpass`'s colon-delimited final field. `_netrc` — the Windows spelling — and `.pgpass` are in
 # neither refusal list, so peek opens both.
-SPACED_SECRET = re.compile(
-    r"((?:^|[ \t])[\w-]*(?:" + SECRET_WORDS + r")[\w-]*[ \t]+)(\S{6,})$", re.I | re.M)
+# 🐛 [2026-09-14] `$` under `re.M` matches before a `\n` and NOT before a `\r`, so this rule --
+# whose whole precision story is that the value is the LAST thing on the line -- stopped firing on
+# any line that ended CRLF. `core.autocrlf=true` is git's Windows default, which means the
+# repository can be LF while the developer's working tree is CRLF, and this module reads the tree:
+#
+#     password Hx7Kq2ZmT4bNvR9w\n      ->  password <REDACTED>
+#     password Hx7Kq2ZmT4bNvR9w\r\n    ->  password Hx7Kq2ZmT4bNvR9w     <- shipped in full
+#
+# A trailing space did the same thing, and an editor leaves those behind constantly. Found by a
+# boundary-mutation battery (R3.1), which is the technique this defect exists to justify: none of
+# the fixed examples in this suite carried a trailing space or a CR, so none of them could see it.
+#
+# A LOOKAHEAD, not a wider capture: the trailing run must not be consumed, or the substitution
+# deletes the whitespace it matched and rewrites lines it was only supposed to inspect.
+# A shell line continuation is still the end of the line as far as a reader is concerned:
+# `mysql --user root \` then `  password hunter2 \` puts the value last on its own line with a
+# backslash after it. Measured before widening: over 847 real files the wider anchor redacts
+# exactly ZERO additional lines, so it costs no precision here, and the callback's own
+# `_is_a_plain_word` guard still refuses `password combination \`.
+_ENDS_THE_LINE = r"(?=[ \t\r]*\\?[ \t\r]*$)"
+SPACED_SECRET = _lazy(lambda: re.compile(
+    r"((?:^|[ \t])[\w-]*(?:" + SECRET_WORDS + r")[\w-]*[ \t]+)(\S{6,})" + _ENDS_THE_LINE,
+    re.I | re.M))
 # A command-line FLAG and its value: `-storepass hunter2`, `--password hunter2`. SPACED_SECRET
 # cannot reach these because it anchors the value at end-of-line, and that anchor is not negotiable
 # — it is what stops the weakest rule in this file from eating prose, which it has done before.
@@ -772,13 +973,13 @@ SPACED_SECRET = re.compile(
 # sentence anybody writes, so this rule needs no plain-word guard the way the adjacency rules do.
 # Bounded to a value with no whitespace, and the flag must be the whole token, so `--password-file
 # creds.txt` (a PATH, not a secret) still has to be handled by the value shape rather than by luck.
-FLAG_SECRET = re.compile(
-    r"((?:^|[ \t])--?[\w-]*(?:" + SECRET_WORDS + r")[\w-]*[ \t]+)(?!-)([^\s]{4,})", re.I | re.M)
-PGPASS_LINE = re.compile(r"^([^:\s]+:\d+:[^:]*:[^:]+:)(\S+)$", re.M)
+FLAG_SECRET = _lazy(lambda: re.compile(
+    r"((?:^|[ \t])--?[\w-]*(?:" + SECRET_WORDS + r")[\w-]*[ \t]+)(?!-)([^\s]{4,})", re.I | re.M))
+PGPASS_LINE = re.compile(r"^([^:\s]+:\d+:[^:]*:[^:]+:)(\S+)" + _ENDS_THE_LINE, re.M)
 
-ASSIGNED_SECRET_CALL = re.compile(
-    r"((?:" + SECRET_WORDS + r")[\w-]*\s*['\"]?\s*" + _KV_SEP + r"\s*)"
-    r"(?!<REDACTED>)([A-Za-z_][\w.]*\s*\(.*)$", re.I | re.M)
+ASSIGNED_SECRET_CALL = _lazy(lambda: re.compile(
+    r"((?:" + SECRET_WORDS + r")[\w-]*\s*(?:['\"]\s*)?" + _KV_SEP + r"\s*)"
+    r"(?!<REDACTED>)([A-Za-z_][\w.]*\s*\(.*)$", re.I | re.M))
 
 # Never opened by the scanner at all, whatever else matches. .gitignore is not relied on: it is
 # often absent, often wrong, and the cost of being wrong here is somebody's private key.
@@ -1006,8 +1207,8 @@ SCHEME_WORDS = frozenset({"bearer", "basic", "digest", "negotiate", "ntlm", "tok
 # expression carrying no literal — a call, a set, a type annotation, True — has nothing to remove
 # and is left alone. Strictly safer than before in both directions: nothing that used to be removed
 # survives, and code that never held a secret stops being destroyed.
-_CODE_EXPRESSION = re.compile(
-    r"^(?:[A-Za-z_]\w*(?:\s*\.\s*\w+)*\s*[([{]|[([{]|(?:True|False|None|self)\b)")
+_CODE_EXPRESSION = _lazy(lambda: re.compile(
+    r"^(?:[A-Za-z_]\w*(?:\s*\.\s*\w+)*\s*[([{]|[([{]|(?:True|False|None|self)\b)"))
 _STRING_LITERAL = re.compile(r"""(['"])((?:\\.|(?!\1)[^\\])*)\1""")
 
 
@@ -1143,8 +1344,8 @@ def _key_ends_in_a_credential_word(key):
 # reads as proof of a password. A credential written down is a literal.
 _VALUE_IS_AN_EXPRESSION = re.compile(r"[(){}]")
 
-_KEY_HOLDS_A_PATTERN = re.compile(r"(?:^|[_\-])(?:re|regex|rx|pattern|patterns|format|"
-                                  r"template|glob|mask|expr|expression)$", re.I)
+_KEY_HOLDS_A_PATTERN = _lazy(lambda: re.compile(r"(?:^|[_\-])(?:re|regex|rx|pattern|patterns|format|"
+                                  r"template|glob|mask|expr|expression)$", re.I))
 
 _NOT_IN_ANY_NAME = re.compile(r"[^A-Za-z0-9._/:~-]")
 
@@ -1492,14 +1693,230 @@ def _value_is_the_key_itself(key_part, value):
 # document on that same file. What the corrected number changes is where a future round should
 # look, which is here rather than at the regexes downstream.
 #
-# Measured and NOT taken: the 51.9 ms this scan costs is the scan itself -- the per-hit work is
-# 0.2 ms of it -- and a cheap literal pre-filter over the same text ("pass", "pwd", "secret",
-# "cred", "token", "key", "auth", which every branch below requires one of) runs in 8.2 ms, so
-# chunking the document and running this only over chunks that contain one would save about 44 ms.
-# It is not built. Chunk boundaries must not split a match, the case-sensitive branches below make
-# the pre-filter's own casing load-bearing, and this module's own rule settles it: a redactor that
-# is slow is a cost, and one that is nearly right is a leak.
+# 🐛 [2026-09-14] The paragraph that stood here refused a literal pre-filter over this scan, and
+# the refusal was right about its own proposal and wrong about the idea. What it proposed was a
+# HAND-WRITTEN stem list -- "pass", "pwd", "secret", "cred", "token", "key", "auth" -- and against
+# that, "a redactor that is nearly right is a leak" settles it: the list is an enumeration of a set
+# that grows every time somebody adds a word below, which is this repository's most recorded
+# defect sitting in the file whose job is not to miss things.
+#
+# The stems are not written by hand any more. `_secret_word_stems` PARSES `SECRET_WORDS` and, for
+# every top-level alternative, derives a set of literals that alternative cannot match without --
+# so adding a word below extends the stem set by itself and cannot be forgotten. A branch it
+# cannot cover disables the whole fast path rather than narrowing it (check 121 fails instead).
+#
+# The old note's own numbers were also measured off `.search()`, which stops at the first hit.
+# What this module actually runs is `finditer` over the whole document, three times per `scrub`:
+#
+#     MAP.md 365 KB     311.4 ms -> 113.0 ms    2.8x     identical hits
+#     run_tests.py      344.6 ms -> 110.5 ms    3.1x     identical hits
+#     README.md         142.7 ms -> 49.3 ms     2.9x     identical hits
+#     lib/redact.py     156.3 ms -> 91.2 ms     1.7x     identical hits
+#
+# Why the gain is there at all: every branch of SECRET_WORDS opens with a lookbehind or a
+# character class, so `re` can extract no literal prefix and tries the whole alternation at every
+# position. This is the coarse-to-fine contract gitleaks and TruffleHog both ship -- one cheap
+# literal pass over the text, the expensive rule only where it hit.
+# 🐛 [2026-09-15] Found from real damage in the owner's infrastructure repository: a break-glass
+# password reached git in four tracked files and sat there fifteen days. The line that carried it
+# was DOCUMENTATION, not configuration —
+#
+#     Plaintext break-glass password `<value>` is still embedded in the groovy
+#
+# Every rule in this module keys on an ASSIGNMENT: a secret word, then `=` or `:`, then the value.
+# That is what a config file looks like. It is not what a person writing a note looks like — a note
+# puts the value in backticks or quotes with nothing between. Six shapes went through untouched,
+# measured against the live module: `password `v``, `password "v"`, `รหัสผ่าน `v``, `token `v``,
+# `secret `v``, and the sentence above.
+#
+# This matters MORE than an assignment, not less. chamnan's own session records, logs and state are
+# prose; they are written to disk every session; and `.chamnan/logs/` is in nobody's `.gitignore`.
+# The redactor was guarding what flows OUT to a model and not what flows DOWN into a commit.
+#
+# Precision comes from the two tests the assignment rules already use, not from a second opinion
+# written beside them: a six-character floor, and `_is_a_plain_word`. So `password `field` is
+# required` keeps its word, and a value with digits and symbols does not. The vocabulary is
+# `SECRET_WORDS`, the same set every other rule reads, so a word added for one is added for all.
+# The vocabulary spells its separator `[_-]` — `api_key`, `api-key`, `apikey` — and never a space,
+# uniformly, across every compound. That is the right boundary for a rule reading configuration and
+# the wrong one for a rule reading a SENTENCE: a person documenting the same thing writes "api key",
+# "access token", "private key". Measured against the live vocabulary: five compounds, none of them
+# reachable with a space.
+#
+# Widened HERE and not in `SECRET_WORDS`, on purpose. Every other rule keys on an assignment, where
+# a space before `=` is not how anybody writes a key, and loosening the shared vocabulary would cost
+# precision in five rules to buy it in one. The guard on the VALUE is unchanged either way.
+# 🐛 `_lazy` wraps a compiled PATTERN, not a string — wrapping the widened vocabulary in it made
+# `str()` reach for `.pattern` on a `str`. It is computed inside the pattern's own lambda instead,
+# which is lazy for the same reason and has no second object to get wrong.
+# 🐛 [2026-09-15] R20.1. The window was `[^\\S\\r\\n]{1,4}` -- one to four whitespace characters
+# between the secret word and the value, so the value had to sit immediately after it. Put any
+# ordinary clause between the two and a real, high-entropy credential walked out:
+#
+#     The break-glass password, which ops rotate quarterly, is `<value>`.
+#     Set the passphrase to '<value>' before running it.
+#     password for the jump host, rotated monthly: `<value>`
+#
+# That is the incident's own shape, and it is the sentence a person is MORE likely to write than the
+# terse one that was caught. `COPULA_SECRET` covered the terse form only, because it requires
+# `is`/`was` immediately after the word as well.
+#
+# So the window is 40 characters of ordinary sentence text, and `_reads_like_a_credential` carries
+# the precision -- which is what that function is for, and why widening the window is what finally
+# made it load-bearing. Measured over all 229 tracked files against the self-scan baseline: five of
+# five leak shapes caught, ZERO new false positives. Each additional guard in the value test was
+# earned by one of them: paths, then calls and dotted names, then product names.
+#
+# A `:` may appear in the gap only when there is a space before it, i.e. the gap is prose rather
+# than `key:` -- an assignment is somebody else's rule and this one must not shadow it.
+DELIMITED_AFTER_SECRET_WORD = _lazy(lambda: re.compile(
+    r"(?<![A-Za-z0-9])(?:" + SECRET_WORDS.replace("[_-]", "[\\s_-]") + r")"
+    r"(?![^\s`\"'=:]*[=:])"
+    r"(?P<gap>[^`\"'\r\n=]{0,40}?)"
+    r"(?P<q>[`\"'])(?P<value>[^`\"'\r\n]{6,200})(?P=q)",
+    re.I))
+
+
+_GAP_IS_PROSE = re.compile(r"\s")
+
+
+def _prose_gap(gap):
+    """A gap carrying a `:` is prose only when something precedes the colon with a space in it."""
+    return ":" not in gap or bool(_GAP_IS_PROSE.search(gap.split(":", 1)[0]))
+
+
 _SECRET_WORD_ANYWHERE = re.compile(SECRET_WORDS, re.I)
+
+
+def _branch_cover(seq, sp):
+    """Literals that EVERY match of this parsed branch must contain, or None if there are none.
+
+    `None` is the honest answer and the safe one: it turns the fast path off entirely rather than
+    letting a branch through a filter that cannot see it.
+    """
+    best, run = None, []
+
+    def flush():
+        nonlocal best
+        if run:
+            word = "".join(run)
+            if best is None or len(word) > len(min(best, key=len)):
+                best = {word.lower()}
+            del run[:]
+
+    for op, av in seq:
+        if op is sp.LITERAL:
+            run.append(chr(av))
+            continue
+        flush()
+        sub = None
+        if op is sp.SUBPATTERN:
+            sub = _branch_cover(av[3], sp)
+        elif op is sp.BRANCH:
+            parts = [_branch_cover(b, sp) for b in av[1]]
+            # Every alternative needs its own stem, and their union covers the branch. One
+            # alternative without a stem makes the whole branch uncoverable.
+            sub = None if any(part is None for part in parts) else set().union(*parts)
+        elif op in (sp.MAX_REPEAT, sp.MIN_REPEAT) and av[0] >= 1:
+            sub = _branch_cover(av[2], sp)
+        elif op in (sp.ASSERT, sp.ASSERT_NOT, sp.AT):
+            continue                      # a lookaround consumes nothing, so it requires nothing
+        if sub and (best is None or len(min(sub, key=len)) > len(min(best, key=len))):
+            best = sub
+    flush()
+    return best
+
+
+def _top_level_branches(seq, sp):
+    items = list(seq)
+    if len(items) == 1 and items[0][0] is sp.SUBPATTERN:
+        return _top_level_branches(items[0][1][3], sp)
+    if len(items) == 1 and items[0][0] is sp.BRANCH:
+        out = []
+        for b in items[0][1][1]:
+            out.extend(_top_level_branches(b, sp))
+        return out
+    return [items]
+
+
+def secret_word_stems():
+    """The minimal literal set every SECRET_WORDS match contains one of -- or None.
+
+    Returned as a sorted list so a check can assert the population rather than a count, and so the
+    same derivation is available to a test without importing the private parser itself.
+    """
+    try:
+        try:
+            from re import _parser as sp          # 3.11+
+        except ImportError:
+            import sre_parse as sp                # 3.8-3.10
+        stems = set()
+        for branch in _top_level_branches(sp.parse(SECRET_WORDS, re.I), sp):
+            cover = _branch_cover(branch, sp)
+            if cover is None:
+                return None                        # one blind branch disables the whole filter
+            stems |= cover
+    except Exception:
+        # A private parser is allowed to change shape under us. Losing the fast path costs time;
+        # guessing at it would cost a leak.
+        return None
+    # A stem containing another stem can never be the only one present, so it is dead weight.
+    return sorted(s for s in stems if not any(other != s and other in s for other in stems))
+
+
+def _make_stem_filter():
+    stems = secret_word_stems()
+    if not stems:
+        return None
+    return re.compile("|".join(sorted(map(re.escape, stems), key=len, reverse=True)), re.I)
+
+
+# Deliberately NOT `_lazy`: that helper caches in `_real` and treats `None` as "not built yet", so
+# a derivation that legitimately returns None would be re-parsed on every single call -- the
+# fallback path would be slower than the scan it falls back to. The sentinel says "asked already".
+_UNBUILT = object()
+_STEM_FILTER = _UNBUILT
+# The stem sits inside the match, never necessarily at its start: `[A-Za-z0-9]+[_-]tokens?` can
+# begin an unbounded identifier earlier, and `mot de passe` reaches back over separators. So a
+# window grows through the whole identifier run around the hit and then by a fixed margin, which
+# is the same lookback the windows downstream already use.
+_STEM_MARGIN = 64
+
+
+def _secret_word_hits(text):
+    """Every `_SECRET_WORD_ANYWHERE` match in `text`, in order -- coarse-to-fine where possible.
+
+    Identical output to `_SECRET_WORD_ANYWHERE.finditer(text)` by construction and by check 121,
+    which holds the two against each other over every file in the installed tree.
+    """
+    global _STEM_FILTER
+    if _STEM_FILTER is _UNBUILT:
+        _STEM_FILTER = _make_stem_filter()
+    lit = _STEM_FILTER
+    if lit is None:
+        return list(_SECRET_WORD_ANYWHERE.finditer(text))
+    n = len(text)
+    spans = []
+    for m in lit.finditer(text):
+        lo, hi = m.start(), m.end()
+        while lo > 0 and (text[lo - 1].isalnum() or text[lo - 1] in "_-"):
+            lo -= 1
+        while hi < n and (text[hi].isalnum() or text[hi] in "_-"):
+            hi += 1
+        lo, hi = max(0, lo - _STEM_MARGIN), min(n, hi + _STEM_MARGIN)
+        if spans and lo <= spans[-1][1]:
+            spans[-1][1] = max(spans[-1][1], hi)
+        else:
+            spans.append([lo, hi])
+    out, seen = [], set()
+    for lo, hi in spans:
+        # `pos`/`endpos` rather than a slice: a lookbehind still sees the characters before `lo`,
+        # so a window boundary cannot manufacture a match that the whole-document scan refuses.
+        for hit in _SECRET_WORD_ANYWHERE.finditer(text, lo, hi):
+            if hit.start() not in seen:
+                seen.add(hit.start())
+                out.append(hit)
+    return out
 _WINDOW = 512
 _WINDOW_LOOKBACK = 64
 # Past this, windowing has stopped being an optimisation and is only a chance to be wrong.
@@ -1518,7 +1935,60 @@ _MAX_WINDOW = 200_000
 # matching too much only makes a window larger — slower, never wrong — and matching too little
 # leaks. It is deliberately more permissive than any rule it protects: every separator any of them
 # accepts, plus `=>`, and `\s*` throughout.
-_OPENS_A_QUOTED_VALUE = re.compile(r"""[\w-]*\s*['"]?\s*(?:=>|""" + _KV_SEP + r""")\s*(['"])""")
+# 🐛 [2026-09-14] `\s*['"]?\s*` is two adjacent `\s*` with an OPTIONAL token between them, so a
+# run of whitespace can be split between them in exponentially many ways and the engine tries them
+# all before failing. The `(a*)*` family, reached without a nested quantifier anywhere in sight —
+# which is exactly what R16-3 warned about, citing Stack Exchange's 34-minute outage of 2016:
+# about 20,000 consecutive whitespace characters and a trim regex with no nested quantifier at all.
+#
+# Measured on `password` + N spaces + one rejecting character, this pattern ALONE:
+#
+#       500 spaces       415.7 ms
+#     1,500 spaces    10,229.5 ms
+#     4,000 spaces   187,562.2 ms      — three minutes, on four kilobytes
+#
+# The whole pipeline reached 17.8 s on 20 KB of that shape while every other shape stayed flat at
+# about 2 ms/KB. `chamnan-map` runs on repositories this project did not write, from a hook, so one
+# file with a long trailing run was a hang with nothing said.
+#
+# The rewrite removes the ambiguity rather than the permissiveness: `\s*(?:['"]\s*)?` accepts the
+# identical language — spaces, then optionally a quote and more spaces — with exactly one way to
+# split the whitespace, because the group cannot be entered without consuming a quote.
+#
+# **Proved equivalent before it shipped, not argued:** identical match spans on 851/851 real files
+# and on 600/600 generated shapes built to exercise this very ambiguity. 597x faster at 4,000
+# spaces. The comment below still holds — this regex decides how far a window REACHES, matching too
+# much is slower and never wrong, matching too little leaks — and the rewrite changes neither
+# direction.
+_OPENS_A_QUOTED_VALUE = re.compile(
+    r"""[\w-]*\s*(?:['"]\s*)?(?:=>|""" + _KV_SEP + r""")\s*(['"])""")
+
+
+_QUALIFIED_PHRASE_ANYWHERE = _lazy(lambda: re.compile(_QUALIFIED_SECRET_PHRASE, re.I))
+
+
+def _window_anchor_hits(text):
+    """Every name a WINDOWED rule can anchor on, in order — not only `SECRET_WORDS`.
+
+    🐛 [2026-09-15] `COPULA_SECRET` was moved inside the windows on 2026-09-15 to stop it sweeping
+    the whole document, and it anchors on `SECRET_WORDS` **or** `_QUALIFIED_SECRET_PHRASE`. The
+    window builder scanned only the first, so `the staging API key is <token>` opened no window and
+    the rule that would have read it never ran there. Three prose cases in the suite went from
+    redacted to clear, which is how it was caught.
+
+    The-set-not-the-member, in the shape that is hardest to see: the two populations had been equal
+    for every rule that was windowed BEFORE, so nothing had ever distinguished "the names the
+    windows cover" from "the names the rules read". They are different sets, and this function is
+    the one place that says so. A rule that is windowed must anchor on something this returns.
+
+    Widening a window is safe by construction -- `_windows_around_secret_words`' own comment says
+    matching too much only makes a window larger, slower and never wrong -- so the merge is by
+    position with no attempt to deduplicate overlapping anchors.
+    """
+    hits = list(_secret_word_hits(text))
+    hits.extend(_QUALIFIED_PHRASE_ANYWHERE.finditer(text))
+    hits.sort(key=lambda m: m.start())
+    return hits
 
 
 def _windows_around_secret_words(text):
@@ -1527,7 +1997,7 @@ def _windows_around_secret_words(text):
     Every boundary sits on a line ending, so a `^` or `$` inside a window means what it would have
     meant in the whole document. Returning None is always safe: it means scan everything.
     """
-    hits = list(_SECRET_WORD_ANYWHERE.finditer(text))
+    hits = _window_anchor_hits(text)
     if not hits:
         return []
     spans = []
@@ -1592,9 +2062,9 @@ _TEMPLATED = re.compile(r"\{[^{}]*\}")
 # `f"sk-{tail}"` leaves the literal `sk-`, four characters, under every length threshold in
 # PATTERNS. Splitting a key across an interpolation must not be a way through, so the prefix alone
 # disqualifies the exemption.
-_CREDENTIAL_PREFIX = re.compile(
+_CREDENTIAL_PREFIX = _lazy(lambda: re.compile(
     r"(?:^|[^A-Za-z0-9])(?:sk-|pk-|rk_|ak_|phc_|ghp_|gho_|ghs_|ghu_|ghr_|github_pat_|xox[baprse]-|"
-    r"AKIA|ASIA|ABIA|ACCA|AIza|ya29\.|glpat-|dop_v1_|shpat_|SG\.|npm_|dckr_pat_)", re.I)
+    r"AKIA|ASIA|ABIA|ACCA|AIza|ya29\.|glpat-|dop_v1_|shpat_|SG\.|npm_|dckr_pat_)", re.I))
 _WEAK_SECRET_WORD = re.compile(r"(?:^|[^A-Za-z])keys?\s*$", re.I)
 
 
@@ -1632,14 +2102,14 @@ def _is_a_template_under_a_weak_name(key_part, value):
 #
 # Deliberately narrow in the other direction too: the name still has to read as a credential, so
 # `password_file = "path/to` is left exactly as `_looks_like_a_credential_name` already leaves it.
-_RESUMES_AFTER_A_VALUE = re.compile(
-    r"""^[ \t]*(?:[\w.-]+|['"][\w.\- ]+['"])[ \t]*(?:=>|""" + _KV_SEP + r""")""")
+_RESUMES_AFTER_A_VALUE = _lazy(lambda: re.compile(
+    r"""^[ \t]*(?:[\w.-]+|['"][\w.\- ]+['"])[ \t]*(?:=>|""" + _KV_SEP + r""")"""))
 
 
 def _close_unterminated_quoted_secrets(text):
     """Redact from an unclosed quote that follows a credential name to where the value must end."""
     out, pos = [], 0
-    for hit in _SECRET_WORD_ANYWHERE.finditer(text):
+    for hit in _secret_word_hits(text):
         if hit.start() < pos:
             continue
         opener = _OPENS_A_QUOTED_VALUE.match(text, hit.end())
@@ -1694,10 +2164,10 @@ _KUBERNETES_SECRET_VALUE_FIELDS = ("data", "stringData")
 _YAML_DOCUMENT_BOUNDARY = re.compile(r"^(?:---|\.\.\.)(?:[ \t]+#.*)?[ \t]*$")
 _KUBERNETES_SECRET_KIND = re.compile(
     r"^kind[ \t]*:[ \t]*(['\"]?)Secret\1[ \t]*(?:#.*)?$")
-_KUBERNETES_SECRET_FIELD = re.compile(
-    r"^(?:" + "|".join(_KUBERNETES_SECRET_VALUE_FIELDS) + r")[ \t]*:[ \t]*(?:#.*)?$")
-_YAML_MAPPING_VALUE = re.compile(
-    r"^([ \t]+(?:['\"][^'\"\n]+['\"]|[^:#\n][^:\n]*?)[ \t]*:[ \t]*)(.*?)(\r?\n?)$")
+_KUBERNETES_SECRET_FIELD = _lazy(lambda: re.compile(
+    r"^(?:" + "|".join(_KUBERNETES_SECRET_VALUE_FIELDS) + r")[ \t]*:[ \t]*(?:#.*)?$"))
+_YAML_MAPPING_VALUE = _lazy(lambda: re.compile(
+    r"^([ \t]+(?:['\"][^'\"\n]+['\"]|[^:#\n][^:\n]*?)[ \t]*:[ \t]*)(.*?)(\r?\n?)$"))
 
 
 def _redacted_yaml_scalar(value):
@@ -1822,7 +2292,179 @@ def fold_confusables(text):
     return text.translate(_CONFUSABLE_FOLD)
 
 
-def scrub(text, windowed=True):
+# 🐛 [2026-09-14] A credential written base64 reached `MAP.md` intact. Reproduced end to end: a file
+# whose OPENING COMMENT reads `# staging creds, kept encoded: <blob>` is summarised into the index,
+# the index is committed, and `base64 -d` on that line returns
+# `aws_secret_access_key=AKIA…`. The same secret written plainly, and the same secret written with
+# `\u0022` quote escapes, are both caught — the escaped form still spells the credential NAME in
+# readable text, and every rule in this file anchors on that name. Base64 removes the name.
+#
+# R13.3, from Truffle Security's account of building TruffleHog: a scanner that reads only the
+# literal bytes misses base64, escaped-unicode and UTF-16 alike, which is why their detectors decode
+# first. GitHub's own scanner misses base64'd AWS keys for the same reason.
+#
+# **This rule decides nothing about what base64 is dangerous.** It decodes, and asks the rules that
+# already exist: if the plaintext would have been redacted, the blob is redacted. A hash, a UUID, a
+# key fingerprint or an embedded image decodes to bytes that are not text and is skipped at the
+# first gate, so the judgement this file already makes is the only judgement made.
+#
+# Measured before shipping, over 883 real files in three trees: **698 base64-shaped runs, 0
+# redacted, 0 false positives.** The cost is 0.3 s over those files, and the gate is `validate=True`
+# plus a printable-ratio test, both of which reject almost everything before a decode is attempted.
+#
+# The blob is replaced whole. Replacing the decoded text would mean re-encoding, and an encoding
+# this module chose is not the one the file had.
+_B64_RUN = re.compile(r"(?<![A-Za-z0-9+/])[A-Za-z0-9+/]{32,}={0,2}(?![A-Za-z0-9+/=])")
+_B64_PRINTABLE_SHARE = 0.9
+
+
+def _redact_encoded_secrets(text):
+    """Redact a base64 run whose PLAINTEXT this module would have redacted, and nothing else."""
+    if "=" not in text and not _B64_RUN.search(text):
+        return text
+
+    def _one(m):
+        blob = m.group(0)
+        try:
+            raw = _b64decode(blob + "=" * (-len(blob) % 4), validate=True)
+        except (ValueError, _binascii.Error):
+            return blob
+        if not raw:
+            return blob
+        printable = sum(32 <= c < 127 or c in (9, 10, 13) for c in raw)
+        if printable / len(raw) < _B64_PRINTABLE_SHARE:
+            return blob                   # not text: a digest, a key, an image. Never touched.
+        # The recursion is bounded by construction: the decoded text is handed to the rules, not
+        # back to this function, so a blob encoding a blob is decoded exactly once.
+        plain = raw.decode("utf-8", "replace")
+        return PLACEHOLDER if PLACEHOLDER in scrub(plain, windowed=False) else blob
+
+    return _B64_RUN.sub(_one, text)
+
+
+_CONFUSABLE_PRESENT = _lazy(lambda: re.compile(
+    "[" + "".join(re.escape(chr(_c)) for _c in sorted(_CONFUSABLE_FOLD)) + "]"))
+
+
+def _unmask_disguised_secret_words(text):
+    """`text` with ONLY the credential words a look-alike letter is hiding rewritten in Latin.
+
+    R13.4. OpenAI's Codex CLI has an open, acknowledged issue of exactly this shape: Cyrillic U+0430
+    standing in for Latin `a` walks past exec-policy string matching. Here it walked past
+    every rule in this file, because every rule anchors on the credential NAME and the name no
+    longer spelt anything: a credential line whose `a` is Cyrillic came out untouched while the
+    ASCII control line beside it redacted. The disguised spelling is NOT written out here, and
+    that is not squeamishness: a live example makes this file the one document in any corpus
+    that trips the expensive branch below, which is the same trap as a check matching its own
+    source, and it cost an hour chasing a 10% slowdown that existed only because this
+    docstring was inside the measurement.
+
+    `fold_confusables` has existed for this since R10 and its docstring refused the obvious
+    wiring, correctly and with a number: folding the whole document as a PRE-PASS means carrying
+    placeholders back into the original by sequence match, which took this package's own files
+    from milliseconds to over two minutes.
+
+    🐛 [2026-09-15] That number refused the stitch-back, and it was then read as refusing the
+    feature. Re-derived: the fold is one codepoint to one codepoint, so OFFSETS ARE PRESERVED, and
+    what the docstring actually asked for is this -- find the spans in the folded view, cut them
+    out of the original, no stitching and no diff. Measured over 1,187 real files: the gate costs
+    0.032 ms/file, 94 files contain any confusable codepoint at all, and **none of them reveals a
+    credential word that the original hides**, so the expensive branch is not reached by real text.
+
+    Deliberately minimal. Only the WORD's own span is rewritten, never the value and never a
+    character anywhere else, and only where the folded view finds a name the original does not --
+    so `пароль`, which the Cyrillic vocabulary already reads, is left exactly as it was written.
+    """
+    if not _CONFUSABLE_PRESENT.search(text):
+        return text
+    folded = fold_confusables(text)
+    known = {(h.start(), h.end()) for h in _secret_word_hits(text)}
+    extra = [h for h in _secret_word_hits(folded) if (h.start(), h.end()) not in known]
+    if not extra:
+        return text
+    out, pos = [], 0
+    for hit in extra:
+        if hit.start() < pos:
+            continue
+        out.append(text[pos:hit.start()])
+        out.append(folded[hit.start():hit.end()])
+        pos = hit.end()
+    out.append(text[pos:])
+    return "".join(out)
+
+
+_LOOKS_LIKE_CODE = re.compile(
+    r"[()\[\]{}]"                                       # a call or a subscript
+    r"|^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)+$")  # a dotted name, and nothing else
+
+
+def _reads_like_a_credential(value):
+    """True when a delimited value in PROSE has the shape of a secret rather than of a word.
+
+    🐛 [2026-09-15] The first version asked only `_is_a_plain_word`, which is the right question for
+    an ASSIGNMENT — there, the key already told you a credential was coming and the only doubt is
+    whether the value is prose. In a sentence the key tells you much less: `key` on its own appears
+    constantly, and chamnan's own documentation supplied both false positives within the hour —
+    "key ends `PRIVATE KEY BLOCK-----`" and `unknown key "_comment" ignored`. Neither value is a
+    secret and both cleared the plain-word test.
+    
+    So prose asks the harder question, of the VALUE: a credential written inline has no spaces, and
+    mixes classes — letters with digits, or letters with punctuation that is not a word character.
+    `PRIVATE KEY BLOCK-----` has spaces. `_comment` is letters and an underscore. A real one is not
+    either of those.
+    """
+    value = (value or "").strip()
+    if len(value) < 6 or " " in value or "\t" in value:
+        return False
+    # 🐛 [2026-09-15] A PATH is not a credential, and prose about configuration is full of them —
+    # chamnan's own comments supplied two more inside the hour: "ledger would key
+    # `.cursor\\rules\\chamnan.mdc`" and "a `read:` key in `.aider.conf.yml`". Both are the word
+    # `key` followed by a backticked file, and both cleared every test above because a path has dots
+    # and separators and is therefore "mixed".
+    #
+    # Scoped to PROSE on purpose: a base64 secret does contain `/`, and `password = "a/b+c="` is
+    # still caught by the assignment rules, which know a credential is coming because the key said
+    # so. Here nothing said so, and in a sentence a slashed or dotted value is a path.
+    if "/" in value or "\\" in value or re.search(r"\.[A-Za-z][A-Za-z0-9]{1,5}$", value):
+        return False
+    if _is_a_plain_word(value) or _is_a_default_credential(value):
+        return False
+    # 🐛 [2026-09-15] A CALL or a DOTTED NAME is not a credential either, and it is the shape
+    # prose about code is made of. chamnan's own tree supplied the failure the same day the rule
+    # shipped: `lib/memory.py:294` reads "The key was `casefold()` alone", and `casefold()` cleared
+    # every test above -- letters plus punctuation that is not a word character. So did
+    # `time.time()`, `resolve()`, `load_config()`, `redact.scrub()`, `core.ignorecase` and
+    # `adapters.generic` across 73 files. A secret is not written with brackets in it, and a value
+    # that is only identifier-dot-identifier is a name, not a value.
+    if _LOOKS_LIKE_CODE.search(value):
+        return False
+    # 🐛 [2026-09-15] And a PRODUCT NAME is not a credential. Widening the prose window
+    # brought one more false positive out of chamnan's own tree: `lib/profiles.py:307` reads
+    # "The first token alone was not the family: \"Qwen3-Coder\" normalised", where the secret word
+    # is `token` and the value is letters, a digit and a hyphen -- mixed classes, so every test
+    # above passed it.
+    #
+    # The shape that separates them is WHERE the digits sit. A product name is words with a version
+    # digit or two on the end of a word; a credential scatters them. `Qwen3-Coder` and `bge-m3` are
+    # the first; `Tr0ub4dor-2026` is not, and neither is anything carrying a symbol. Two or three
+    # groups only, the same bound `_is_a_plain_word` uses, so a four-word passphrase stays a
+    # credential.
+    _groups = re.split(r"[-_]", value)
+    if 2 <= len(_groups) <= 3 and all(re.fullmatch(r"[A-Za-z]{2,}\d{0,2}", g) for g in _groups):
+        return False
+    # 🐛 [2026-09-15] A value with an `=` INSIDE it is a fragment of code or a query string,
+    # not a secret written in a sentence -- chamnan's own tree supplied `per_dir=0` from a comment
+    # about coverage ties. Trailing `=` is the exception and must stay, because that is base64
+    # padding and a base64 secret is exactly what this is here to catch.
+    if re.search(r"=(?!=*$)", value):
+        return False
+    letters = any(c.isalpha() for c in value)
+    digits = any(c.isdigit() for c in value)
+    symbols = any(not c.isalnum() and c != "_" for c in value)
+    return letters and (digits or symbols)
+
+
+def scrub(text, windowed=True, *, _unmask=True):
     """Every string that leaves chamnan for a written file goes through this.
 
     `windowed=False` runs every rule over the whole document, which is what this did before the
@@ -1833,11 +2475,29 @@ def scrub(text, windowed=True):
     """
     if not text:
         return text
+    # A look-alike letter in the credential NAME hides it from every rule below, because every
+    # rule below anchors on that name. Rewriting the name is a change to the reader's text, so it
+    # is made only when it BUYS something: both results are compared and the disguised spelling is
+    # kept unless unmasking it actually redacts more. `_unmask=False` is how that second run asks
+    # for the plain pipeline, and is the only thing that stops this recursing. (R13.4.)
+    if _unmask:
+        _unmasked = _unmask_disguised_secret_words(text)
+        if _unmasked is not text:
+            _with = scrub(_unmasked, windowed, _unmask=False)
+            _without = scrub(text, windowed, _unmask=False)
+            return _with if _with.count(PLACEHOLDER) > _without.count(PLACEHOLDER) else _without
     text = _redact_kubernetes_secret_data(text)
-    for pattern in PATTERNS + LATE_PREFIXES:
+    for pattern in PATTERNS + [DELIMITED_AFTER_SECRET_WORD] + LATE_PREFIXES:
         # A pattern with one group keeps everything outside it: "Bearer <REDACTED>" stays readable
         # as an Authorization header while the credential goes. Groupless patterns replace whole.
-        if pattern.groups == 1:
+        # Two groups, and only the value goes — the sentence has to stay readable or the reader
+        # cannot tell what was removed. Same shape as AUTH_SCHEME_SECRET below, one rule further on.
+        if pattern is DELIMITED_AFTER_SECRET_WORD:
+            text = pattern.sub(
+                lambda m: m.group(0)
+                if not _prose_gap(m.group("gap")) or not _reads_like_a_credential(m.group("value"))
+                else m.group(0).replace(m.group("value"), PLACEHOLDER), text)
+        elif pattern.groups == 1:
             # Same position in the order, one extra question asked. See _is_a_plain_word.
             if pattern is AUTH_SCHEME_SECRET:
                 text = pattern.sub(
@@ -1870,7 +2530,20 @@ def scrub(text, windowed=True):
     # api key is rotated monthly`, `the private key is generated on first run`, `the access token
     # is refreshed automatically`, `the session token is short-lived by design` -- twelve of twelve
     # left intact, against six of six real credentials replaced.
-    text = COPULA_SECRET.sub(
+    # 🐛 [2026-09-15] This was the last rule anchored on a secret word that still swept the WHOLE
+    # document, and SECRET_WORDS carries three `[A-Za-z0-9]+[_-]` runs whose `+` backtracks at every
+    # start position of an unbroken alphanumeric run. On a document ending in one, that is O(n^2):
+    # 16 KiB of digits took longer than the 8-second ceiling the CPU-curve harness allows, against
+    # 0.2 s for the same size of ordinary prose. R16-2 asked for the whole-pipeline curve precisely
+    # because no per-pattern microbenchmark shows this — every OTHER secret-word rule was already
+    # inside a window, so the cost only appears when `scrub` is measured end to end.
+    #
+    # Windowing is the module's own answer and it is not a narrowing here: the match must BEGIN with
+    # a SECRET_WORDS hit, so it cannot start outside a window; and `\S{6,}` cannot cross a newline
+    # while every window is extended to a line ending, so it cannot end outside one either. Position
+    # in the sequence is unchanged — this restricts WHERE the rule runs, not WHEN. `windowed=False`
+    # still scans everything, and the suite holds the two against each other on a boundary corpus.
+    _copula = lambda chunk: COPULA_SECRET.sub(
         lambda m: m.group(0)
         if (_inside_sql_comment_on(m)
             or _is_a_plain_word(m.group(2))
@@ -1878,7 +2551,10 @@ def scrub(text, windowed=True):
             or m.group(2).lower().rstrip(".,;:") in SCHEME_WORDS
             or _is_only_a_template(m.group(2))
             or _names_a_mechanism(m.group(1), m.group(2)))
-        else f"{m.group(1)}{PLACEHOLDER}", text)
+        else f"{m.group(1)}{PLACEHOLDER}"
+             f"{_structure_the_value_did_not_open(m, m.group(2))}", chunk)
+    text = _apply_in_windows(text, _windows_around_secret_words(text) if windowed else None,
+                              [_copula])
     # `=>` is not optional in ROCKET_SECRET — it is the operator the rule exists to read, and the
     # pattern cannot match a document that does not contain those two characters. The word list in
     # front of it is large, so the engine walks the whole document looking for a hit that is
@@ -1912,7 +2588,8 @@ def scrub(text, windowed=True):
         if m.group(2).startswith("-") else m.group(0)
         if _names_a_mechanism(m.group(1), m.group(2)) or not _looks_like_a_credential_name(m.group(1), m.group(2))
         or PLACEHOLDER in m.group(2) or (_is_a_plain_word(m.group(2)) and not _is_a_default_credential(m.group(2)))
-        else f"{m.group(1)}{PLACEHOLDER}", chunk)
+        else f"{m.group(1)}{PLACEHOLDER}"
+             f"{_structure_the_value_did_not_open(m, m.group(2))}", chunk)
     _flag = lambda chunk: FLAG_SECRET.sub(
         lambda m: m.group(0) if PLACEHOLDER in m.group(2)
         # The next FLAG is not this flag's value. `tool --password --verbose` means the password
@@ -1923,7 +2600,8 @@ def scrub(text, windowed=True):
         # and `-storepass:file x.txt` name a path the reader may need; redacting it hides which
         # file to go and protect.
         or m.group(1).rstrip().endswith("-file") or "/" in m.group(2) or m.group(2).endswith(".txt")
-        else f"{m.group(1)}{PLACEHOLDER}", chunk)
+        else f"{m.group(1)}{PLACEHOLDER}"
+             f"{_structure_the_value_did_not_open(m, m.group(2))}", chunk)
     _assigned = lambda chunk: ASSIGNED_SECRET.sub(
         lambda m: m.group(0)
         if _names_a_mechanism(m.group(1), m.group(3)) or not _looks_like_a_credential_name(m.group(1), m.group(3))
@@ -1949,8 +2627,14 @@ def scrub(text, windowed=True):
         or _is_documented_field_name(m)
         or _is_documented_prose(m)
         or _is_a_template_under_a_weak_name(m.group(1), m.group(2))
-        else f"{m.group(1)}{_redact_literals_in(m.group(2)) or PLACEHOLDER}"
-        + " " * 0, chunk)
+        # The tail is appended only when the whole value became a PLACEHOLDER. When
+        # `_redact_literals_in` rewrites the value instead, what it returns already CONTAINS that
+        # tail -- appending it again duplicated the bracket, which the same idempotence relation
+        # that found the original bug caught in the fix for it within the hour.
+        else f"{m.group(1)}{_redact_literals_in(m.group(2))}"
+        if _redact_literals_in(m.group(2))
+        else f"{m.group(1)}{PLACEHOLDER}"
+             f"{_structure_the_value_did_not_open(m, m.group(2))}", chunk)
 
     # The five rules above are the whole of what SECRET_WORDS-anchored scanning costs, and on the
     # real map most of the document cannot match any of them. Windows are computed twice because
@@ -1981,6 +2665,9 @@ def scrub(text, windowed=True):
     # The personal-data layer, after the credential rules: a card number inside a connection string
     # has already gone, and what is left for this to find is a bare number in prose or a fixture.
     text = _redact_personal_data(text)
+    # After every rule above, so the decoded plaintext is judged by the whole pipeline rather than
+    # by whatever half of it had run by this point.
+    text = _redact_encoded_secrets(text)
     # Before the three rules below, and on the whole text rather than inside a window: an unclosed
     # value's continuation can sit any distance from the name that opened it, and the rules below
     # would otherwise consume the opening quote and leave that continuation behind.
@@ -2134,10 +2821,10 @@ _DIGIT_FOLD = str.maketrans({
 # using it, one character (R1 agent 2).
 _SEP = r"[ \t.\u00a0\u2007\u2009\u202f-]"
 # The grouped form: four-digit groups separated by a single separator, or Amex's 4-6-5.
-_CARD_GROUPED = re.compile(
+_CARD_GROUPED = _lazy(lambda: re.compile(
     r"(?<![0-9A-Za-z_-])((?:[0-9]{4}" + _SEP + r"){3}[0-9]{3,4}"
     r"|[0-9]{4}" + _SEP + r"[0-9]{6}" + _SEP + r"[0-9]{5})"
-    r"(?![0-9A-Za-z_-])")
+    r"(?![0-9A-Za-z_-])"))
 _CARD_BARE = re.compile(r"(?<![0-9A-Za-z_-])(" + _CARD_BRANDS + r")(?![0-9A-Za-z_-])")
 
 # WHY THE GROUPED FORM NEEDS NO KEYWORD AND THE BARE FORM DOES, and why the false positive that
@@ -2174,18 +2861,18 @@ _CARD_BARE = re.compile(r"(?<![0-9A-Za-z_-])(" + _CARD_BRANDS + r")(?![0-9A-Za-z
 # the trade above inverts and this comment is the place to start.
 # Words that say "the digits near me are a card". Deliberately short: a longer list is a wider net,
 # and the checksum is doing the real work.
-_CARD_WORD = re.compile(
-    r"(?i)(?<![a-z])(card|cc|ccnum|pan|credit|debit|บัตรเครดิต|บัตรเดบิต|เลขบัตร)(?![a-z])")
+_CARD_WORD = _lazy(lambda: re.compile(
+    r"(?i)(?<![a-z])(card|cc|ccnum|pan|credit|debit|บัตรเครดิต|บัตรเดบิต|เลขบัตร)(?![a-z])"))
 
 # Thailand's 13-digit national ID. The checksum is a weighted sum, which is why this can be told
 # from an epoch timestamp at all -- and only barely, hence the context requirement.
-_THAI_ID_DASHED = re.compile(
+_THAI_ID_DASHED = _lazy(lambda: re.compile(
     r"(?<![0-9])([1-8])" + _SEP + r"([0-9]{4})" + _SEP + r"([0-9]{5})" + _SEP
-    + r"([0-9]{2})" + _SEP + r"([0-9])(?![0-9])")
+    + r"([0-9]{2})" + _SEP + r"([0-9])(?![0-9])"))
 _THAI_ID_BARE = re.compile(r"(?<![0-9A-Za-z_-])([1-8][0-9]{12})(?![0-9A-Za-z_-])")
-_THAI_ID_WORD = re.compile(
+_THAI_ID_WORD = _lazy(lambda: re.compile(
     r"(?i)(?<![a-z])(national[_ -]?id|citizen[_ -]?id|id[_ -]?card|idcard|thai[_ -]?id"
-    r"|เลขประจำตัวประชาชน|บัตรประชาชน|ประชาชน)(?![a-z])")
+    r"|เลขประจำตัวประชาชน|บัตรประชาชน|ประชาชน)(?![a-z])"))
 
 
 # Korea's 13-digit Resident Registration Number, written `YYMMDD-Sxxxxxx`. It carries a birth date
@@ -2203,9 +2890,9 @@ _THAI_ID_WORD = re.compile(
 # the gate, which is the bar each of the other three schemes cites.
 _RRN_DASHED = re.compile(r"(?<![0-9])([0-9]{6})" + _SEP + r"([1-8][0-9]{6})(?![0-9])")
 _RRN_BARE = re.compile(r"(?<![0-9A-Za-z_-])([0-9]{6}[1-8][0-9]{6})(?![0-9A-Za-z_-])")
-_RRN_WORD = re.compile(
+_RRN_WORD = _lazy(lambda: re.compile(
     r"(?i)(?<![a-z])(resident[_ -]?registration|rrn|korean[_ -]?id"
-    r"|주민등록번호|주민번호)(?![a-z])")
+    r"|주민등록번호|주민번호)(?![a-z])"))
 
 # ---- identifiers that are not Thai, because we do not get to know where the user is
 #
@@ -2250,11 +2937,11 @@ _IBAN_LENGTHS = {
 # People write an IBAN two ways and only two: one unbroken run, or groups of four. " today" is five
 # letters after a space and is neither, so both alternatives below refuse it while the printed forms
 # a bank statement actually uses still match.
-_IBAN = re.compile(r"(?i)(?<![A-Za-z0-9])("
+_IBAN = _lazy(lambda: re.compile(r"(?i)(?<![A-Za-z0-9])("
                    r"[A-Z]{2}[0-9]{2}[A-Za-z0-9]{10,30}"                      # one unbroken run
                    r"|[A-Z]{2}[0-9]{2}(?:" + _SEP + r"[A-Za-z0-9]{4}){2,7}"   # groups of four
                    r"(?:" + _SEP + r"[A-Za-z0-9]{1,3})?"                      # a short last group
-                   r")(?![A-Za-z0-9])")
+                   r")(?![A-Za-z0-9])"))
 # 🐛 [2026-09-08] `(?i)`, because this was the only rule in the file that was NOT
 # case-insensitive: `de89370400440532013000` leaked in full while the identical number
 # in capitals was redacted. The country code is conventionally upper case and the
@@ -2282,17 +2969,17 @@ _IBAN = re.compile(r"(?i)(?<![A-Za-z0-9])("
 # runs passes mod 11, and an order id or a timestamp is eleven digits often enough that shape alone
 # would be a guess. The word is what makes it a finding. Brazil spells it out as well as abbreviates.
 _CPF_BARE = re.compile(r"(?<![0-9A-Za-z_-])([0-9]{11})(?![0-9A-Za-z_-])")
-_CPF_WORD = re.compile(
+_CPF_WORD = _lazy(lambda: re.compile(
     r"(?i)(?<![a-z])(cpf|cadastro[_ -]?de[_ -]?pessoas[_ -]?f[i\u00ed]sicas"
-    r"|cadastro[_ -]?pessoa[_ -]?f[i\u00ed]sica)(?![a-z])")
-_CPF_DOTTED = re.compile(r"(?<![0-9])([0-9]{3}" + _SEP + r"[0-9]{3}" + _SEP
-                         + r"[0-9]{3}" + _SEP + r"[0-9]{2})(?![0-9])")
-_AADHAAR = re.compile(r"(?<![0-9])([0-9]{4}" + _SEP + r"?[0-9]{4}" + _SEP + r"?[0-9]{4})(?![0-9])")
+    r"|cadastro[_ -]?pessoa[_ -]?f[i\u00ed]sica)(?![a-z])"))
+_CPF_DOTTED = _lazy(lambda: re.compile(r"(?<![0-9])([0-9]{3}" + _SEP + r"[0-9]{3}" + _SEP
+                         + r"[0-9]{3}" + _SEP + r"[0-9]{2})(?![0-9])"))
+_AADHAAR = _lazy(lambda: re.compile(r"(?<![0-9])([0-9]{4}" + _SEP + r"?[0-9]{4}" + _SEP + r"?[0-9]{4})(?![0-9])"))
 # 🐛 [2026-09-08] "UID" was missing -- the acronym UIDAI is named for, and what the number is
 # ordinarily called. The gate exists because Verhoeff passes 9.99% of random 12-digit
 # numbers, so the word beside it is doing the real work and a missing word is a leak.
-_AADHAAR_WORD = re.compile(
-    r"(?i)(?<![a-z])(aadhaar|aadhar|uidai|uid|\u0906\u0927\u093e\u0930)(?![a-z])")
+_AADHAAR_WORD = _lazy(lambda: re.compile(
+    r"(?i)(?<![a-z])(aadhaar|aadhar|uidai|uid|\u0906\u0927\u093e\u0930)(?![a-z])"))
 
 
 def _iban(text):
@@ -2412,8 +3099,8 @@ def _thai_national_id(digits):
 # schemes now rather than written as a number: the gate admits the shortest identifier any
 # rule below it can match, so adding a shorter scheme moves this by arriving.
 SHORTEST_IDENTIFIER = 11        # CPF. Nothing this layer matches is shorter.
-_A_LONG_DIGIT_RUN = re.compile(
-    r"[0-9](?:[0-9]|" + _SEP + r"){%d,}[0-9]" % (SHORTEST_IDENTIFIER - 2))
+_A_LONG_DIGIT_RUN = _lazy(lambda: re.compile(
+    r"[0-9](?:[0-9]|" + _SEP + r"){%d,}[0-9]" % (SHORTEST_IDENTIFIER - 2)))
 
 
 # The delimiters a real export uses. `|` is here for the markdown table form, which is how a
@@ -2514,7 +3201,10 @@ _HEADER_LANGS = {
     "Turkish": ("şifre", "sifre"),
     "Vietnamese": ("mật_khẩu", "matkhau"),
     "Indonesian": ("kata_sandi",),
-    "Thai": ("รหัสผ่าน", "รหัส"),
+    # `รหัส` alone is the Thai for CODE, and English's row above is the policy: `code` is not a
+    # password column header, so a column named `รหัส` is a product or reference code far more
+    # often than a credential. Same correction as the vocabulary table. (R3.5.)
+    "Thai": ("รหัสผ่าน", "รหัสลับ"),
     "Chinese": ("密码", "密碼", "口令"),
     "Japanese": ("パスワード", "暗証番号"),
     "Korean": ("비밀번호", "암호"),
@@ -2523,12 +3213,12 @@ _HEADER_LANGS = {
     "Hindi": ("पासवर्ड",),
 }
 
-_HEADER_WORD = re.compile(
-    r"""^\s*["']?\s*(?:"""
+_HEADER_WORD = _lazy(lambda: re.compile(
+    r"""^\s*(?:["']\s*)?(?:"""
     + _HEADER_BARE
     + r"""|[\w-]*[_-](?:""" + _HEADER_TAIL + r"""|key|token)s?"""
     + r"""|(?-i:[a-z0-9]+(?:Password|Passwd|Passphrase|Secret|Token|Key|Credential)s?)"""
-    + r""")\s*["']?\s*$""", re.I)
+    + r""")\s*(?:["']\s*)?$""", re.I))
 
 
 def _split_row(line, delim):
@@ -2593,11 +3283,11 @@ def _is_a_header_row(fields):
 # the first element was redacted and the rest printed beside it. Measured on a three-element JSON
 # array of generic secrets: one redacted, two in the clear, with a `<REDACTED>` at the front of them
 # saying the line had been handled. A YAML block sequence was missed outright (R3 agent 2).
-_LIST_OPEN = re.compile(
-    r"(?<![\w-])(['\"]?)((?:" + SECRET_WORDS + r")[\w-]*)\1(\s*" + _KV_SEP + r"\s*)\[([^\[\]]*)\]", re.I)
+_LIST_OPEN = _lazy(lambda: re.compile(
+    r"(?<![\w-])(['\"]?)((?:" + SECRET_WORDS + r")[\w-]*)\1(\s*" + _KV_SEP + r"\s*)\[([^\[\]]*)\]", re.I))
 # A YAML block sequence: the key alone on its line, then indented `- item` lines under it.
-_BLOCK_KEY = re.compile(
-    r"^(\s*['\"]?)((?:" + SECRET_WORDS + r")[\w-]*)(['\"]?\s*:\s*)$", re.I)
+_BLOCK_KEY = _lazy(lambda: re.compile(
+    r"^(\s*['\"]?)((?:" + SECRET_WORDS + r")[\w-]*)(['\"]?\s*:\s*)$", re.I))
 _BLOCK_ITEM = re.compile(r"^(\s+-\s+)(['\"]?)(.+?)\2(\s*)$")
 # A bare number in such a list is a port, a retry count or a length, not a credential. Redacting it
 # costs a reader information and hides nothing, and it is the one element type that is safe to keep.
