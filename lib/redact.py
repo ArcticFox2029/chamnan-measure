@@ -247,7 +247,7 @@ def _declares_a_type(match):
     `interface Config { apiKey: string; }` each had their TYPE NAME replaced with `<REDACTED>`,
     destroying the one piece of information the line carried and protecting nothing. Shipped in
     1.23.1; every TypeScript, Swift and Kotlin repository this indexed lost those lines. Matches
-    gitleaks/gitleaks#2182, which is the same defect in the same position (R8 agent 9).
+    gitleaks/gitleaks#2182, which is the same defect in the same position (R8 agent 9, 2026-09-08).
 
     Three signals, any one of which is enough, and each chosen because a configuration format
     cannot produce it: a declaration keyword on the line, a primitive type name as the whole value,
@@ -291,14 +291,14 @@ PATTERNS = [
     re.compile(r"(?<![A-Za-z0-9])(?:gh[pousr]_|github_pat_)[A-Za-z0-9_]{16,}"),
     # 🐛 [2026-09-08] `xoxe-` and `xoxe.` are Slack's rotation-era refresh and access
     # tokens, introduced 2021, and neither matched `xox[baprs]-` -- so a rotated token
-    # leaked in full with the word "token" on the same line (R2 agent 2).
+    # leaked in full with the word "token" on the same line (R2 agent 2, 2026-09-08).
     re.compile(r"(?<![A-Za-z0-9])xox[baprse]-[A-Za-z0-9-]{10,}"),
     re.compile(r"(?<![A-Za-z0-9])xoxe\.xox[bp]-[A-Za-z0-9.-]{10,}"),
     # \U0001f41b [2026-09-09] Six vendor prefixes that this module NAMES in `_CREDENTIAL_PREFIX` and
     # never enforced anywhere. Measured with each vendor's documented body length and charset,
     # computed rather than typed: a Google OAuth token, a DigitalOcean personal token, a Shopify
     # private-app token, a Docker Hub personal token, a PostHog project key and a SendGrid key all
-    # left in full, bare and assigned to a variable alike (R10 agent 2, finding 2).
+    # left in full, bare and assigned to a variable alike (R10 agent 2, 2026-09-09, finding 2).
     #
     # `_CREDENTIAL_PREFIX` is not a missing enforcement list, which is the tempting reading. It is
     # the EXEMPTION test in `_is_a_template_under_a_weak_name`, where being generous is the safe
@@ -352,7 +352,7 @@ PATTERNS = [
     # The whole thing leaked -- header, and a claims payload that is base64, not encryption. The
     # floor stays on the first two segments, which is what stops `a.b.c` prose from matching; the
     # signature may now be empty, and a trailing dot is required so a two-segment string still is
-    # not a token. (R3 agent 2.)
+    # not a token. (R3 agent 2, 2026-09-08.)
     re.compile(r"(?<![A-Za-z0-9])eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]*"
                r"(?![A-Za-z0-9_-])"),
     # Private key and certificate blocks.
@@ -549,7 +549,7 @@ _LATIN_SECRET_WORDS = (
     # So did `REDISPASSWORD` and `SMTPPASSWORD`. The module had already patched seven instances of
     # this shape by name (`dbpassword`, `apikey`, …) with a comment calling itself "a SHORT
     # EXPLICIT LIST" — an enumeration of a set that has no end, which is this repository's most
-    # recorded defect, sitting in the file whose job is not to miss things (R1 agent 2).
+    # recorded defect, sitting in the file whose job is not to miss things (R1 agent 2, 2026-09-09).
     #
     # The boundary is dropped only for the words that are never an innocent substring. `password`,
     # `passwd`, `passphrase`, `secret` and `credential` do not appear inside ordinary identifiers
@@ -573,7 +573,7 @@ _LATIN_SECRET_WORDS = (
     # `DB_TOKEN=` and `access_token_a=` were caught, and while every one of the other ten
     # credential words was caught in that shape. Found by probing an outward finding that was
     # itself wrong: a secret split across `TOKEN_A`/`TOKEN_B` was the case it could not see
-    # (R3 agent2). A real key-shaped line in this machine's own tree, spelled `KEY_1=`, is
+    # (R3 agent2, 2026-09-11). A real key-shaped line in this machine's own tree, spelled `KEY_1=`, is
     # unredacted today and caught by this.
     #
     # A LEADING credential word is weaker evidence than a trailing one -- `token_uri`,
@@ -591,7 +591,7 @@ _LATIN_SECRET_WORDS = (
     # `pass` is a Python KEYWORD that appears on its own line in most files in this repository.
     # A leading component is what separates a credential from the statement — `ansible_ssh_pass`
     # from `    pass` — and it costs nothing on the secret side, because every real spelling of
-    # this one carries a prefix (R1 agent 2).
+    # this one carries a prefix (R1 agent 2, 2026-09-09).
     r"|(?<![A-Za-z])[A-Za-z0-9]+[_-]pass(?:words?)?(?![A-Za-z])"
     # \U0001f41b [2026-09-11] ...and the same word in SCREAMING_CASE, which the separator rule above
     # cannot reach and which the 2026-09-10 fix gave to `TOKEN` and `KEY` and not to this one.
@@ -635,7 +635,7 @@ _LATIN_SECRET_WORDS = (
     # through byte for byte, next to the name that says exactly what they are. The `password` and
     # `secret` half of this shape was fixed on 2026-09-09 by dropping the left boundary for the
     # words that are never an innocent substring; `key` and `token` could not follow, because they
-    # are (R1 agent 2, finding 1).
+    # are (R1 agent 2, 2026-09-10, finding 1).
     #
     # `TOKEN` takes an uppercase run in front of it outright: no ordinary all-caps identifier ends
     # in it. `KEY` cannot, and the reason is the whole difficulty — `MONKEY`, `DONKEY`, `TURKEY`,
@@ -761,7 +761,7 @@ _NOT_A_CREDENTIAL_NAME = _lazy(lambda: re.compile(
     # 🐛 [2026-09-08] `api_key_env = "MY_SECRET1"` holds the NAME of an environment
     # variable, not the variable's value -- the whole point of the indirection is that
     # the secret is NOT in the file. Redacting it destroys the one thing the line says
-    # and hides nothing. Matches Yelp/detect-secrets#923 (R8 agent 9).
+    # and hides nothing. Matches Yelp/detect-secrets#923 (R8 agent 9, 2026-09-08).
     r"|env|envvar|environ|variable|var|varname)$", re.I))
 
 CREDENTIALED_URL = _lazy(lambda: re.compile(
@@ -774,7 +774,7 @@ CREDENTIALED_URL = _lazy(lambda: re.compile(
     # which real connection strings routinely do not do. Measured: `amqp://svc:a@b@rabbit/vhost`
     # and `mongodb://root:x@y%40z@cluster/admin` passed through whole, and
     # `postgres://admin:Hunter2@Pass@db/main` was redacted down to `<REDACTED>@Pass@db/main`,
-    # leaving half the password beside the marker that says it was handled (R2 agent 2).
+    # leaving half the password beside the marker that says it was handled (R2 agent 2, 2026-09-08).
     #
     # `/` and whitespace still end the password, so the match cannot run past the authority into a
     # path — and being greedy, it takes the LAST `@` before that boundary, which is the one that
@@ -837,9 +837,30 @@ _BETWEEN_NAME_AND_VALUE = (
 # whether this is worth having, and it is measured -- `tools/redactor_recall.py` reports it.
 _TYPE_BEFORE_ASSIGN = r"(?:[ \t]+[A-Za-z_][\w.]*(?:\[[^\]\n]*\])?)?[ \t]*=[ \t]*"
 
+# 🐛 [2026-09-17] A value written on the line AFTER the separator was found — `\s*` behind the
+# separator crosses a newline — unless a grouping paren or a backslash continuation stood between
+# them, which nothing consumed:
+#
+#     api_key = (          MISSED          api_key = \          MISSED
+#         "<the value>"                        "<the value>"
+#     )
+#
+# A bracket in the same position was already handled, which is this package's most recorded defect
+# wearing its usual costume: one member of a set fixed, the identical one beside it left. Admitting
+# `(` here cannot re-open the case the value class excludes it for — `AWS_SECRET =
+# base64.b64decode("QUtJQ…")`, where `base64.b64decode(` was captured AS the secret — because this
+# only matches a bracket standing IMMEDIATELY after the separator, which is grouping or a list
+# literal. A call has its callee's name in that position, and `ASSIGNED_SECRET_CALL` still owns it.
+#
+# Deliberately NOT applied to `ASSIGNED_SECRET_BARE`: its value is `\S{6,}` with no closing quote to
+# backstop a wrong guess, so a bracket there would widen a rule that already has no anchor. An
+# unquoted credential inside a grouping paren on its own line is not a shape any config format
+# produces, and the trade is the one this module keeps making — precision over the last percent.
+_GROUPING_BEFORE_VALUE = r"(?:(?:[\[(]|\\)\s*)?"
+
 ASSIGNED_SECRET = _lazy(lambda: re.compile(
     r"((?:" + SECRET_WORDS + r")[\w-]*(?:\s*(?:['\"]\s*)?" + _KV_SEP + r"\s*" + _BETWEEN_NAME_AND_VALUE
-    + r"|" + _TYPE_BEFORE_ASSIGN + r"))(['\"])([^'\"]{6,})\2", re.I))
+    + r"|" + _TYPE_BEFORE_ASSIGN + r")" + _GROUPING_BEFORE_VALUE + r")(['\"])([^'\"]{6,})\2", re.I))
 # The same assignment without quotes, which is how every .env and .ini file on earth is written.
 # Requiring quotes meant DATABASE_PASSWORD=tr0ub4dor&3-horse passed through untouched. Bounded to a
 # single unbroken run of characters so a prose comment ("password: ask the platform team") is not
@@ -894,7 +915,7 @@ ASSIGNED_SECRET_BARE = _lazy(lambda: re.compile(
 # tpuf_hmNxzxxxP3yL8R for now` passed through byte for byte -- a clean miss, no marker, in the
 # shape a person uses when they are TELLING somebody a key rather than configuring one: a comment,
 # a chat message, a support ticket, a commit message. Matches protectai/llm-guard#293, whose
-# reporter filed the same sentence (R8 agent 8).
+# reporter filed the same sentence (R8 agent 8, 2026-09-08).
 #
 # The qualifier list is why this is shippable. `SECRET_WORDS` requires a separator before `key` and
 # `token` -- a measured decision that keeps 70 of 129 ordinary Python lines intact -- so "API key"
@@ -1041,7 +1062,7 @@ def _has_source_extension(name):
 # keystore's readable strings, alias and password-shaped fragment included. A PEM key survived by
 # luck — the greedy BEGIN/END pattern still matched its text — but a BINARY keystore is exactly what
 # NEVER_OPENED_SUFFIXES exists for, and its extracted strings carry no `=` or `:` for any
-# SECRET_WORDS rule to key on, so nothing downstream catches them (R1 agent 2).
+# SECRET_WORDS rule to key on, so nothing downstream catches them (R1 agent 2, 2026-09-09).
 #
 # Judged on BOTH names, not the resolved one alone: a dangling link has no target to resolve and
 # must still be refused by its own name, and a link whose name is innocent must be refused by its
@@ -1164,7 +1185,7 @@ _CONFIG_ABOUT_A_SECRET = ("policy", "policies", "rotation", "days", "window", "l
 # 🐛 [2026-09-08] A name that holds the NAME of an environment variable is the one shape where the
 # secret is provably NOT in the file -- that is the entire point of the indirection.
 # `api_key_env = "MY_SECRET1"` was redacted, which destroyed the only thing the line said and hid
-# nothing. Matches Yelp/detect-secrets#923 (R8 agent 9).
+# nothing. Matches Yelp/detect-secrets#923 (R8 agent 9, 2026-09-08).
 _NAMES_A_VARIABLE = ("env", "envvar", "environ", "variable", "var", "varname")
 # Every tuple whose words must ALSO appear in `_NOT_A_CREDENTIAL_NAME`'s regex, which is defined
 # above this point and therefore spells them out rather than interpolating them. Named as one
@@ -1253,7 +1274,7 @@ def _looks_like_a_credential_name(key, value=None):
     # "https://oauth2.googleapis.com/token"` -- a public URL in every Google service-account file --
     # along with `token_cost` and `key_first`. Measured over 8,806 files: the ungated version
     # destroyed 21 ordinary lines, this one destroys none of them and still catches every
-    # `TOKEN_A=` shape (R3 agent2, found by probing a claim that was itself wrong).
+    # `TOKEN_A=` shape (R3 agent2, 2026-09-11, found by probing a claim that was itself wrong).
     if _CREDENTIAL_WORD_LEADS.match(bare) and not _value_overrides_the_name(value, key):
         return False
     if not _NOT_A_CREDENTIAL_NAME.search(bare):
@@ -1261,7 +1282,7 @@ def _looks_like_a_credential_name(key, value=None):
     # 🐛 The tail decided alone, so ~50 ordinary endings — `id`, `type`, `name`, `field` — exempted
     # the value whatever it was. Reproduced end to end through `bin/chamnan-peek --find`:
     # `api_secret_id = "AKIAIOSFODNN7EXAMPLE1234"` and `db_password_type = "tr0ub4dor3horsebattery"`
-    # printed in full (R12 agent 2). The exemption is still needed — `secret_name` and
+    # printed in full (R12 agent 2, 2026-09-07). The exemption is still needed — `secret_name` and
     # `api_key_path` genuinely name things, and redacting those is the noise that gets a redactor
     # switched off — so the name still decides unless the VALUE settles it.
     #
@@ -1277,7 +1298,7 @@ def _looks_like_a_credential_name(key, value=None):
 # the adjacency rules use, applied in the other direction.
 # 🐛 Named `_CREDENTIAL_SHAPED` when it was added, which is ALSO the name of an existing constant
 # further down this file — so Python bound the later one and this rule silently ran against a
-# different pattern than the one written beside it (R13 agent 2). A collision at module scope is
+# different pattern than the one written beside it (R13 agent 2, 2026-09-07). A collision at module scope is
 # invisible: no error, no warning, and the code reads correctly.
 _LONG_MIXED_VALUE = re.compile(r"^[A-Za-z0-9+/=_\-.]{16,}$")
 
@@ -1312,6 +1333,43 @@ _CREDENTIAL_END_WORDS = frozenset("""
 _NOUNS_AFTER_A_CREDENTIAL = frozenset("""
     id ids name names type types field fields label labels kind value
 """.split())
+
+# The connective words an ordinary English sentence is built from, and a Diceware-style passphrase
+# never is -- a passphrase is content words only. Used by `_looks_like_a_passphrase` below to tell
+# "correct horse battery staple" (no member of this set) from "must be rotated quarterly" (two).
+# English only, on purpose: a Thai or Japanese passphrase has no spaces to split into tokens in the
+# first place, so this filter cannot see one either way, and pretending otherwise here would be
+# worse than the gap.
+_ENGLISH_FUNCTION_WORDS = frozenset("""
+    a an the and or but nor yet so for of with by from as into onto upon over under between through
+    during before after about above below across against along among around behind beside besides
+    beyond despite except inside near outside since toward towards underneath until within without
+    i you he she it we they me him her us them this that these those who whom whose which what
+    is are was were be been being am have has had do does did will would shall should may might
+    must can could not no if than when where while because although though unless whether either
+    neither both each every any all few many much more most such own same in on at
+""".split())
+
+# A passphrase token: letters only, with an internal hyphen allowed so `correct-horse` counts as
+# one token. A digit, a dot, a slash or any other punctuation disqualifies the whole value -- those
+# are exactly the paths and dotted names `_reads_like_a_credential`'s other guards were earned by.
+_PASSPHRASE_TOKEN = re.compile(r"^[A-Za-z]+(?:-[A-Za-z]+)*$")
+
+
+def _looks_like_a_passphrase(value):
+    """True when a SPACED value has the shape of a passphrase, not of a sentence.
+
+    All three conditions have to hold together. 3 to 8 whitespace-separated tokens: fewer is not a
+    passphrase, more is prose. Every token alphabetic (an internal hyphen allowed): a token holding
+    a digit, a dot or any other punctuation is a path or a version string, not passphrase content.
+    No token a function word: a passphrase is content words, and ordinary prose is not.
+    """
+    tokens = value.split()
+    if not (3 <= len(tokens) <= 8):
+        return False
+    if not all(_PASSPHRASE_TOKEN.match(t) for t in tokens):
+        return False
+    return not any(t.lower() in _ENGLISH_FUNCTION_WORDS for t in tokens)
 
 
 def _key_ends_in_a_credential_word(key):
@@ -1442,7 +1500,7 @@ def _names_a_mechanism(key, value=None):
     🐛 It read the key and nothing else, so ~50 ordinary tails — `name`, `id`, `type`, `field`,
     `path` — exempted the value whatever it was. Reproduced end to end through
     `bin/chamnan-peek --find`: `api_secret_id = "AKIAIOSFODNN7EXAMPLE1234"` and
-    `db_password_type = "tr0ub4dor3horsebattery"` printed in full (R12 agent 2).
+    `db_password_type = "tr0ub4dor3horsebattery"` printed in full (R12 agent 2, 2026-09-07).
     
     The exemption is still right and still needed — `secret_name = "the-name-of-my-secret"` and
     `api_key_path = "/etc/keys/prod.pem"` genuinely name things, and redacting those is the noise
@@ -1494,18 +1552,63 @@ def _looks_like_more_credential(token):
     return (has_digit and (has_upper or has_lower)) or (has_upper and has_lower and len(token) >= 12)
 
 
+_QUOTE_CHARS = "'\""
+# The gap between two adjacent string literals -- implicit concatenation's only separator, on one
+# line, across a bare newline, or across a backslash line-continuation (which a shell or Python
+# logical line treats as whitespace too, per `_GROUPING_BEFORE_VALUE` a few screens up). A comma,
+# an operator or any other character here means these are not adjacent literals at all, which is
+# what stops this from merging two DIFFERENT list elements into one run.
+_LITERAL_GAP = re.compile(r"[ \t]*(?:\\?\r?\n[ \t]*)*")
+
+
 def _swallow_trailing_credential_runs(text, start):
     """How many characters after `start` are more of the same credential. 0 when the next run is
-    prose, which is the common case and the one the space boundary exists to protect."""
+    prose, which is the common case and the one the space boundary exists to protect.
+
+    🐛 [2026-09-18] (R47 agent 2, 2026-09-18) A credential split across two adjacent string literals --
+
+        api_key = (
+            "sk_live_"
+            "<the real 40-character body>"
+        )
+
+    -- left the SECOND literal untouched: the bare provider-prefix on the first line absorbed the
+    name anchor and got its `<REDACTED>`, and this function's own newline stop meant it never
+    looked past that line. Worse than a plain miss, since the marker says the line was handled.
+
+    Fixed only for a value that was itself QUOTED -- a matching quote character sits immediately
+    before `start` (it opened the value) and immediately after it (it closed the value), the shape
+    every quoted-value replacement in this module leaves behind. From there, whitespace -- possibly
+    crossing one or more newlines, nothing else -- followed by another literal opened with that
+    SAME quote character is swallowed too, as long as `_looks_like_more_credential` still calls its
+    contents more of the same, and the process repeats for as many adjacent literals as qualify.
+    The trailing quote of the LAST literal consumed is left standing, so the placeholder keeps a
+    syntactically closed value instead of an unterminated one.
+
+    The unquoted rule (`ASSIGNED_SECRET_BARE`) gets none of this: its value class is `\\S{6,}` with
+    no closing quote to backstop a wrong guess, and letting THAT cross a newline is how this module
+    has leaked before -- see the comment beside it. It also has no quote character flanking `start`
+    for this to key off, so the check below simply never triggers for it.
+    """
+    quote = None
+    before = start - len(PLACEHOLDER) - 1
+    if before >= 0 and start < len(text) and text[before] in _QUOTE_CHARS and text[start] == text[before]:
+        quote = text[before]
     end = start
     while True:
         gap = re.match(r"[ \t]+", text[end:])
-        if not gap:
-            return end - start
-        run = re.match(r"[^\s]+", text[end + gap.end():])
-        if not run or not _looks_like_more_credential(run.group(0)):
-            return end - start
-        end += gap.end() + run.end()
+        if gap:
+            run = re.match(r"[^\s]+", text[end + gap.end():])
+            if run and _looks_like_more_credential(run.group(0)):
+                end += gap.end() + run.end()
+                continue
+        if quote and end < len(text) and text[end] == quote:
+            cross = _LITERAL_GAP.match(text[end + 1:])
+            literal = _STRING_LITERAL.match(text[end + 1 + cross.end():])
+            if literal and literal.group(1) == quote and _looks_like_more_credential(literal.group(2)):
+                end = end + 1 + cross.end() + literal.end() - 1
+                continue
+        return end - start
 
 
 def _full_key_at(match):
@@ -1645,7 +1748,7 @@ def _value_is_the_key_itself(key_part, value):
         return False
     # 🐛 ...and only when the key says something BESIDES the secret word. `password = "password"` is
     # the commonest weak credential there is, and this exemption was letting it through as a label
-    # (R13 agent 2). A label's key carries another component — `s_secrets`, `password_label`,
+    # (R13 agent 2, 2026-09-07). A label's key carries another component — `s_secrets`, `password_label`,
     # `secret_name` — because it is naming a thing, not holding one. A key that is only the secret
     # word, with a value that repeats it, is a password somebody did not choose.
     if any(other != word for other in parts):
@@ -2090,7 +2193,7 @@ def _is_a_template_under_a_weak_name(key_part, value):
 # the text fell through to `ASSIGNED_SECRET_BARE`, which captured the one `\S{6,}` run sitting on
 # the same line as the quote and left the continuation in the clear. Both modes agreed on the wrong
 # answer, so windowing neither caused it nor hid it -- confirmed open by two independent rounds
-# (R1 agent 2 finding 5, R2 agent 2 finding 3) and by the backlog before them.
+# (R1 agent 2, 2026-09-06 finding 5, R2 agent 2 finding 3) and by the backlog before them.
 #
 # The detection was never the hard part; the STOP was. Redacting to end-of-document eats unrelated
 # content, and an unterminated string is what a truncated paste, a half-finished edit or a merge
@@ -2393,6 +2496,87 @@ def _unmask_disguised_secret_words(text):
     return "".join(out)
 
 
+# U+FE00-FE0F and their supplementary range U+E0100-E01EF are variation selectors -- category
+# `Mn` (nonspacing mark), not `Cf` -- so a category test alone misses them. Listed here rather than
+# in `_TERMINAL_SAFE` above (which this deliberately does not share a table with -- see the
+# docstring below) because that table is applied to a whole document and this one only ever to a
+# candidate word span.
+_INVISIBLE_VARIATION_SELECTORS = frozenset(
+    chr(_c) for _c in range(0xFE00, 0xFE10)
+) | frozenset(chr(_c) for _c in range(0xE0100, 0xE01F0))
+
+
+def _is_planted_invisible(ch):
+    """True for a codepoint that renders as nothing and can be planted inside a word to split it.
+
+    Category `Cf` (format character) covers ZWSP, ZWNJ, ZWJ, the word joiner, the Unicode Tags
+    block, the directional marks and BOM in one test. It also covers U+00AD SOFT HYPHEN -- verified
+    live rather than trusted from a report: `unicodedata.category("­")` returns `Cf` under
+    this interpreter's Unicode 16.0.0 tables. Variation selectors are `Mn`, not `Cf` (checked the
+    same way), so they are added from the explicit set above.
+    """
+    return unicodedata.category(ch) == "Cf" or ch in _INVISIBLE_VARIATION_SELECTORS
+
+
+def _unmask_invisible_secret_words(text):
+    """`text` with ONLY the credential words an invisible codepoint is splitting rewritten whole.
+
+    Same shape as `_unmask_disguised_secret_words` just above, for a different disguise: instead of
+    a look-alike letter substituted for one of the word's own, an invisible codepoint is INSERTED
+    between two of them -- `pass<ZWSP>word` -- so `SECRET_WORDS` does not match and everything that
+    anchors on it, including the value beside it, is skipped.
+
+    R8 (2026-09-05) left ZWJ, ZWNJ and the directional marks out of `_TERMINAL_SAFE` on purpose:
+    stripped from a whole document they corrupt real Devanagari/Bengali conjuncts and pull emoji
+    families apart. That reason is about a DOCUMENT. This function only ever looks inside a
+    candidate SECRET_WORDS span, never the document, and inside the letters of `password` or
+    `api key` there is no legitimate use for any of these codepoints -- so its strip set can be the
+    wider, property-derived one above without repeating R8's mistake. That boundary is why this is
+    its own function rather than a call site reusing `_TERMINAL_SAFE`.
+
+    Reproduced against this module before this function existed, five shapes: ZWSP U+200B, ZWNJ
+    U+200C, soft hyphen U+00AD, a Unicode Tag character (e.g. U+E0061) and the word joiner U+2060,
+    each inserted mid-word left `scrub()` returning the input unchanged.
+
+    Deliberately minimal, same contract as `_unmask_disguised_secret_words`: only the WORD's own
+    span is rewritten, never the value and never a character anywhere else in `text`, and only
+    where removing the invisible codepoints reveals a name the original span does not already read
+    as. Unlike confusable folding this is not a 1:1 codepoint map -- the invisible codepoints are
+    dropped, so positions shift -- hence the explicit origin index below instead of the direct
+    offset reuse the confusable version uses.
+    """
+    if not any(_is_planted_invisible(ch) for ch in text):
+        return text
+    kept_chars, origin = [], []
+    for i, ch in enumerate(text):
+        if _is_planted_invisible(ch):
+            continue
+        kept_chars.append(ch)
+        origin.append(i)
+    stripped = "".join(kept_chars)
+    known = {(h.start(), h.end()) for h in _secret_word_hits(text)}
+    extra = []
+    for h in _secret_word_hits(stripped):
+        if h.start() == h.end():
+            continue
+        orig_start, orig_end = origin[h.start()], origin[h.end() - 1] + 1
+        if (orig_start, orig_end) in known:
+            continue
+        extra.append((orig_start, orig_end, stripped[h.start():h.end()]))
+    if not extra:
+        return text
+    extra.sort()
+    out, pos = [], 0
+    for start, end, word in extra:
+        if start < pos:
+            continue
+        out.append(text[pos:start])
+        out.append(word)
+        pos = end
+    out.append(text[pos:])
+    return "".join(out)
+
+
 _LOOKS_LIKE_CODE = re.compile(
     r"[()\[\]{}]"                                       # a call or a subscript
     r"|^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)+$")  # a dotted name, and nothing else
@@ -2412,10 +2596,17 @@ def _reads_like_a_credential(value):
     mixes classes — letters with digits, or letters with punctuation that is not a word character.
     `PRIVATE KEY BLOCK-----` has spaces. `_comment` is letters and an underscore. A real one is not
     either of those.
+
+    A SPACED value is not rejected outright any more, since a Diceware-style passphrase is a
+    credential too and it walks straight through the rest of this function unspaced-only. Handed
+    off to `_looks_like_a_passphrase`, which asks the narrower question a space cannot answer by
+    itself: content words, none of them a function word, on their own.
     """
     value = (value or "").strip()
-    if len(value) < 6 or " " in value or "\t" in value:
+    if len(value) < 6:
         return False
+    if " " in value or "\t" in value:
+        return _looks_like_a_passphrase(value)
     # 🐛 [2026-09-15] A PATH is not a credential, and prose about configuration is full of them —
     # chamnan's own comments supplied two more inside the hour: "ledger would key
     # `.cursor\\rules\\chamnan.mdc`" and "a `read:` key in `.aider.conf.yml`". Both are the word
@@ -2486,6 +2677,16 @@ def scrub(text, windowed=True, *, _unmask=True):
             _with = scrub(_unmasked, windowed, _unmask=False)
             _without = scrub(text, windowed, _unmask=False)
             return _with if _with.count(PLACEHOLDER) > _without.count(PLACEHOLDER) else _without
+        # A second disguise, same contract: an invisible codepoint INSERTED inside the word rather
+        # than a look-alike SUBSTITUTED for one of its letters. Checked only when the confusable
+        # branch above found nothing to unmask -- the two attacks have not been seen combined, and
+        # trying both unconditionally would mean reasoning about which of four variants to keep
+        # rather than two, for a case not yet observed.
+        _destripped = _unmask_invisible_secret_words(text)
+        if _destripped is not text:
+            _with = scrub(_destripped, windowed, _unmask=False)
+            _without = scrub(text, windowed, _unmask=False)
+            return _with if _with.count(PLACEHOLDER) > _without.count(PLACEHOLDER) else _without
     text = _redact_kubernetes_secret_data(text)
     for pattern in PATTERNS + [DELIMITED_AFTER_SECRET_WORD] + LATE_PREFIXES:
         # A pattern with one group keeps everything outside it: "Bearer <REDACTED>" stays readable
@@ -2512,7 +2713,7 @@ def scrub(text, windowed=True, *, _unmask=True):
     # `.env.example` or `docker-compose.yml` is written in, so the redactor was damaging exactly the
     # documentation whose whole job is to show the shape without the secret. `{{ password }}` came
     # out worse still — the marker swallowed the closing braces and the rest of the line with them
-    # (R8 agent 2). `_TEMPLATED` is the module's existing answer to this question; the URL rule was
+    # (R8 agent 2, 2026-09-06). `_TEMPLATED` is the module's existing answer to this question; the URL rule was
     # the one place that did not ask it.
     text = CREDENTIALED_URL.sub(
         lambda m: m.group(0) if _is_only_a_template(m.group(2))
@@ -2650,7 +2851,7 @@ def scrub(text, windowed=True, *, _unmask=True):
     # alike -- and so did the pipe-delimited form a markdown table produces. That is not one rule
     # missing a case: it is the file's whole adjacency architecture meeting a shape it has no
     # reader for, and a database dump, a password-manager export and a spreadsheet paste all
-    # produce it (R2 agent 2).
+    # produce it (R2 agent 2, 2026-09-08).
     #
     # Deliberately narrow, because a wide rule here destroys the index this tool exists to write.
     # A header is only a header when a field is EXACTLY a credential or personal-data word -- not a
@@ -2729,6 +2930,30 @@ def scrub(text, windowed=True, *, _unmask=True):
 #
 # In this table rather than at the call sites, for the reason stated above: a per-call rule is one
 # every future print has to remember, and the misses are silent (R11 acc3, hostile repo).
+# 🎯 [R46 #4/#5, 2026-09-17] `_TERMINAL_SAFE` above strips ANSI escapes so a committed file cannot
+# rewrite what a reader sees. Probed the same way: a chat-template control token -- `<|im_start|>`,
+# `<|im_end|>`, `<|endoftext|>` -- sits in ordinary text next to it and passes through untouched,
+# because it is made of printable characters and this table only ever removed non-printing ones.
+# The route is a user's own workspace file (`STATE.md`, `memory/`, a rule) reaching the SessionStart
+# block through `for_a_terminal`, the same choke point every hook already routes through -- not a
+# second filter, this one, extended.
+#
+# Matched generically rather than enumerated, the same reasoning `_TERMINAL_SAFE`'s own history
+# argues (R12/R13 above: "some members of a set" is the recorded failure mode) -- `<|word|>` covers
+# `im_start`, `im_end`, `endoftext`, `system`, `start_header_id` and any future one without a
+# hand-maintained list to fall out of date. The inner run excludes whitespace and `<>|` themselves,
+# so it cannot cross a line or swallow a second sentinel, and it requires at least one inner
+# character, so `<|>` alone (no content) never matches.
+#
+# Defused, not deleted: the text is a user's own file, and they may be writing ABOUT these tokens
+# (this finding's own writeup does). Replacing only the two `|` delimiters with U+00A6 BROKEN BAR
+# leaves `im_start` readable in place -- a person reading `<¦im_start¦>` still sees exactly what
+# token is being discussed -- while the byte sequence a chat template parses no longer exists.
+# Ordinary punctuation is untouched: `a < b | c > d`, a bare `|`, and a markdown table row
+# `| a | b |` have no `<|...|>` shape to match.
+_CHAT_TEMPLATE_SENTINEL = re.compile(r"<\|([^\s<>|]+)\|>")
+
+
 _TERMINAL_SAFE = str.maketrans({
     **{chr(i): None for i in range(0x20) if chr(i) not in "\n\t"},
     chr(0x7F): None,
@@ -2744,12 +2969,12 @@ _TERMINAL_SAFE = str.maketrans({
     # What is added here is the set with no legitimate role in prose: 2061-2064 are invisible MATH
     # operators (FUNCTION APPLICATION, INVISIBLE TIMES/SEPARATOR/PLUS), and 206A-206F are deprecated
     # by Unicode itself. FFF9-FFFB are interlinear annotation, which Unicode says is not for plain
-    # text interchange. None of these appears in a comment anybody wrote on purpose (R12 agent 2).
+    # text interchange. None of these appears in a comment anybody wrote on purpose (R12 agent 2, 2026-09-07).
     # \U0001f41b [2026-09-07] 0x2060 (WORD JOINER), added after the range beside it. The previous
     # pass took 2061-2064 and stopped one code point short of the zero-width character most often
     # named in smuggling write-ups -- the same "some members of a set" mistake, made while fixing
     # that mistake. It has a typographic use (joining without a break) that no source comment has
-    # ever needed, and it is invisible, which is the property that matters here (R13 agent 2).
+    # ever needed, and it is invisible, which is the property that matters here (R13 agent 2, 2026-09-07).
     **{chr(i): None for i in range(0x2060, 0x2065)},
     **{chr(i): None for i in range(0x2066, 0x2070)},
     **{chr(i): None for i in range(0xFFF9, 0xFFFC)},
@@ -2818,7 +3043,7 @@ _DIGIT_FOLD = str.maketrans({
 # 🐛 [2026-09-08] The tab was missing, and a tab is what a spreadsheet, a TSV export and a
 # copy out of a terminal table all produce -- so a card number, a Thai national ID or an
 # Aadhaar number pasted from any of them went through whole. One constant, three rules
-# using it, one character (R1 agent 2).
+# using it, one character (R1 agent 2, 2026-09-09).
 _SEP = r"[ \t.\u00a0\u2007\u2009\u202f-]"
 # The grouped form: four-digit groups separated by a single separator, or Amex's 4-6-5.
 _CARD_GROUPED = _lazy(lambda: re.compile(
@@ -2839,7 +3064,7 @@ _CARD_BARE = re.compile(r"(?<![0-9A-Za-z_-])(" + _CARD_BRANDS + r")(?![0-9A-Za-z
 # which makes the identical no-context false positive reachable in Thai, Arabic-Indic, Persian,
 # Devanagari, Tamil and fullwidth digits too. Six times the surface, described as if it were one —
 # a risk accepted on a measurement that had already stopped being the whole measurement by the time
-# it was committed (R9 agent 3). The acceptance below still holds, and it now covers what it says
+# it was committed (R9 agent 3, 2026-09-07). The acceptance below still holds, and it now covers what it says
 # it covers: an identifier written in ANY of those scripts is judged by the same shape test, so a
 # Thai-numeral device id is as redactable as an ASCII one, and for the same reason.
 #
@@ -2932,7 +3157,7 @@ _IBAN_LENGTHS = {
 # with " today" inside it, the length stopped equalling Germany's 22, mod-97 failed, and the rule
 # redacted NOTHING. Six of ten realistic sentences leaked a real IBAN in full -- and the leak needed
 # the commonest shape in prose, a number followed by a word, which is why the module's own
-# false-POSITIVE measurement never met it (R1 agent 2).
+# false-POSITIVE measurement never met it (R1 agent 2, 2026-09-09).
 #
 # People write an IBAN two ways and only two: one unbroken run, or groups of four. " today" is five
 # letters after a space and is neither, so both alternatives below refuse it while the printed forms
@@ -2948,7 +3173,7 @@ _IBAN = _lazy(lambda: re.compile(r"(?i)(?<![A-Za-z0-9])("
 # pattern was written as if that were a rule; it is a convention, and a value pasted
 # out of a database or lower-cased by a logger is neither invalid nor rare. Survived
 # the rewrite this pattern got earlier the same day, which is exactly where a new gap
-# is expected to be (R2 agent 2).
+# is expected to be (R2 agent 2, 2026-09-08).
 # Brazil's CPF, in the form people actually write it. The bare 11-digit run is deliberately NOT
 # matched: at 1% it would be tolerable on its own, but 11-digit runs are ordinary in code and the
 # dotted form is what appears in a record somebody pasted.
@@ -3139,7 +3364,7 @@ _HEADER_BARE = (
     # with an `ssh_pass` column printed its values into the transcript — the same gap in the
     # header list as in the assignment list, found in the same round. Written with the separator,
     # matching how the assignment rule treats it and for the same reason: a bare `pass` column is
-    # more often a test result than a credential (R1 agent 2).
+    # more often a test result than a credential (R1 agent 2, 2026-09-09).
     #
     # The known cost, chosen rather than overlooked: a column genuinely called `first_pass` has its
     # values hidden. This list already redacts a whole column called `key` on the same reasoning,
@@ -3282,7 +3507,7 @@ def _is_a_header_row(fields):
 # job -- rotated keys, a pool of tokens, two passwords during a migration -- and under those rules
 # the first element was redacted and the rest printed beside it. Measured on a three-element JSON
 # array of generic secrets: one redacted, two in the clear, with a `<REDACTED>` at the front of them
-# saying the line had been handled. A YAML block sequence was missed outright (R3 agent 2).
+# saying the line had been handled. A YAML block sequence was missed outright (R3 agent 2, 2026-09-08).
 _LIST_OPEN = _lazy(lambda: re.compile(
     r"(?<![\w-])(['\"]?)((?:" + SECRET_WORDS + r")[\w-]*)\1(\s*" + _KV_SEP + r"\s*)\[([^\[\]]*)\]", re.I))
 # A YAML block sequence: the key alone on its line, then indented `- item` lines under it.
@@ -3324,7 +3549,7 @@ def _redact_secret_lists(text):
     # in half, the tail read as a line that is not a `- item`, the block loop exited, and EVERY
     # sibling secret below it was left in the clear -- with a `<REDACTED>` printed on the line above,
     # which is worse than a plain miss because it says the line was handled. Reproduced 8 of 8, in
-    # code written hours earlier the same day (R7 agent 1).
+    # code written hours earlier the same day (R7 agent 1, 2026-09-08).
     #
     # YAML defines its block structure with `\n` and nothing else, so `\n` is what this splits on.
     # A `\r` stays at the end of its piece and survives the rejoin, and the eight characters above
@@ -3442,7 +3667,7 @@ def _redact_personal_data(text):
         # pretty-printed JSON value, a support ticket and a chat transcript are all written.
         # 16 of 17 generated multi-line shapes passed through whole, each with a valid checksum,
         # each with no marker beside it. `YAML_BLOCK_SECRET` exists for exactly this problem on the
-        # credential side of this file; nothing equivalent existed here (R5 agent 2, R6 acc2).
+        # credential side of this file; nothing equivalent existed here (R5 agent 2, 2026-09-08, R6 acc2).
         #
         # The window is the LABEL side only. The number is still matched in `folded` -- the current
         # line -- and still has to pass its own checksum, so this widens what counts as context and
@@ -3516,7 +3741,12 @@ def _redact_personal_data(text):
     return "".join(out)
 
 def for_a_terminal(text):
-    """Repository text with the characters that rewrite what a reader sees removed."""
+    """Repository text with the characters that rewrite what a reader sees removed.
+
+    Also defuses chat-template control-token sentinels (`<|im_start|>` and the like) -- see
+    `_CHAT_TEMPLATE_SENTINEL` above.
+    """
+    text = _CHAT_TEMPLATE_SENTINEL.sub("<¦\\1¦>", text)
     return text.translate(_TERMINAL_SAFE)
 
 

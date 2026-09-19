@@ -97,6 +97,136 @@ def a_program_is_lying_in_wait(root, names=("git",)):
 # `rev-list`) and have nothing to fetch, so this costs them nothing.
 os.environ.setdefault("GIT_NO_LAZY_FETCH", "1")
 
+# A repository chooses what `git` RUNS, and one of our reads is enough to trigger it.
+#
+# 🐛 [2026-09-18] (R3 agent 2, 2026-09-18) Reproduced here end to end, not taken from the advisory: a repository whose own
+# `.git/config` carries `core.fsmonitor = <a program>` executes that program when git refreshes the
+# index, and `git status --porcelain` refreshes the index. `hooks/chamnan_session_start.py` runs
+# exactly that, on every session, inside whatever repository the user opened. A clone, a dependency
+# checkout or a pull request branch is therefore able to run code as the user the moment a session
+# starts — with no prompt, because nothing here is being asked to trust anything. The payload in the
+# reproduction wrote a file and exited 1; git carried on and reported a clean status.
+#
+# That is the GitSpawn class (Manifold/Shattered, 2026), the same key behind Copilot CLI's
+# GHSA-9ccr-r5hg-74gf, and the shape Claude Code itself shipped a fix for in 2.0.71. `core.pager` is
+# the older cousin — git's default pager is `less`, whose `!` escape hands over a shell (CVE-2017-8386)
+# — and it costs nothing to close beside it even though our calls capture output and never page.
+#
+# The population is the full class, not those two examples: eleven repository-settable keys that
+# cause git to run a program — `core.fsmonitor`, `core.pager`, `core.editor`, `core.sshCommand`,
+# `core.askPass`, `core.hooksPath`, `diff.external`, `credential.helper`,
+# `uploadpack.packObjectsHook`, `sequence.editor`, `gpg.program`. Of those, only `core.fsmonitor`
+# (via `git status`) and `diff.external` (via `git diff`) are reachable by this package's own
+# read-only commands today; the other nine are closed pre-emptively because each is one new call
+# site (an editor invocation, a push, a credential prompt) away from becoming reachable, and closing
+# them now costs nothing a call site would otherwise have to remember to do itself.
+#
+# Set through the ENVIRONMENT rather than by adding `-c` to each call, for the reason the block above
+# gives: there are twenty-five `git` invocations across eight files, every entry point imports this
+# module, and three of the four times this repository has tried to fix something at N call sites it
+# has missed one. `GIT_CONFIG_COUNT`/`_KEY_n`/`_VALUE_n` is git's documented way to inject config
+# into every child, it outranks the repository's own config, and a hostile `.git/config` cannot
+# unset it. Verified both ways in the reproduction: with these set the payload does not run; without
+# them it does.
+#
+# Appended to whatever the user already has rather than assigned, so an existing `GIT_CONFIG_COUNT`
+# keeps its entries and ours are added after it.
+def _harden_git_config():
+    """Refuse the repository-controlled config keys that turn a read into an execution."""
+    # 🐛 [2026-09-19] (self-measured) Five of these were `""`, and on Windows assigning an empty
+    # string to an environment variable DELETES it. `GIT_CONFIG_COUNT` still said 11 while
+    # `GIT_CONFIG_VALUE_3` no longer existed, so git refused every command it was given:
+    # `error: missing config value GIT_CONFIG_VALUE_3`, and `git init` exited 128. Every git
+    # feature in the package was dead on Windows and nothing here could see it — the suite's checks
+    # read `os.environ`, which still holds the key because Python keeps its own copy; git reads the
+    # real environment block, which does not. Found by the CI matrix on a release check, which is
+    # the only instrument in this project that runs on Windows at all.
+    #
+    # Git does not fold whitespace either: measured, `GIT_CONFIG_VALUE_0=" "` comes back as one
+    # space, not as empty. So an empty value simply cannot be carried this way on Windows, and the
+    # replacement has to express "refuse" rather than "unset". A name that cannot resolve to a
+    # program does that on both platforms, identically, which is worth more than a per-OS branch:
+    # git tries to run it, fails loudly, and the repository's own command never runs. The three
+    # keys below that already used `true`/`cat` were doing exactly this and were never empty.
+    #
+    # `diff.external` is the one with a caller: both `git diff` sites in this package now pass
+    # `--no-ext-diff`, so the refusal is stated on the command line and never reaches this value.
+    _REFUSE = "chamnan-refuses-repository-supplied-command"
+    forced = (
+        ("core.fsmonitor", "false"),
+        ("core.pager", "cat"),
+        ("core.editor", "true"),
+        ("core.sshCommand", _REFUSE),
+        ("core.askPass", _REFUSE),
+        ("core.hooksPath", "/dev/null"),
+        ("diff.external", _REFUSE),
+        ("credential.helper", _REFUSE),
+        ("uploadpack.packObjectsHook", _REFUSE),
+        ("sequence.editor", "true"),
+        ("gpg.program", "true"),
+    )
+    try:
+        start = int(os.environ.get("GIT_CONFIG_COUNT", "0") or 0)
+    except ValueError:
+        start = 0
+    if start < 0:
+        start = 0
+    for offset, (key, value) in enumerate(forced):
+        os.environ["GIT_CONFIG_KEY_%d" % (start + offset)] = key
+        os.environ["GIT_CONFIG_VALUE_%d" % (start + offset)] = value
+        _FORCED_AT[key] = start + offset
+    os.environ["GIT_CONFIG_COUNT"] = str(start + len(forced))
+
+
+# Which slot each forced key occupies, so a read-only query can ask git what the REPOSITORY says
+# about one of them. See `_env_reading` below.
+_FORCED_AT = {}
+
+_harden_git_config()
+
+
+# 🐛 [2026-09-19] (self-measured), from the full gate run of this date. `core.hooksPath` is forced to `/dev/null` above so a repository's hooks cannot
+# run when chamnan invokes git. But `git_hooks_dir` ASKS git where hooks live, through the same
+# environment — so it answered `/dev/null` in every repository on earth. `chamnan-report` then told
+# every user their pre-commit hook was missing, right after they installed it, and
+# `chamnan-map --install-git-hook` died with `FileExistsError: /dev/null` before it could install
+# anything. The whole documented feature was unreachable, in a clean clone, on any machine.
+#
+# The forced value is about EXECUTION; a query that only reads is a different question. So one
+# read-only call site may neutralise ONE key for itself, and nothing more: the slot is overwritten
+# with an inert key rather than removed, because renumbering `GIT_CONFIG_COUNT` would silently drop
+# whichever entry the caller's own environment had after ours.
+# Whether this is Windows, as one value a test can override. `os.name` cannot be patched
+# for that purpose: `pathlib` dispatches on it at construction time.
+_IS_WINDOWS = os.name == "nt"
+
+_INERT_SETTING_NAME = "chamnan.inert"
+
+
+def _env_reading(key):
+    """A copy of the environment with every forced value for `key` stood down.
+
+    Only for commands that READ. `rev-parse --git-path hooks` resolves a path and runs nothing,
+    which is why dropping the hooks override for it cannot re-open what the override closed. Do not
+    reach for this from a command that can execute what the key names.
+
+    🐛 [2026-09-19] (self-measured), from the full gate run of this date. The first version of this cleared the ONE slot this process wrote, and that is
+    wrong the moment chamnan runs chamnan: the child appends its eleven entries after the parent's
+    eleven, so the key it neutralises is its own copy and the parent's is still in force, still
+    naming /dev/null. `--install-git-hook` worked from a shell and failed from the test suite for
+    exactly that reason. Every slot naming the key is stood down, whoever wrote it.
+    """
+    env = dict(os.environ)
+    try:
+        count = int(env.get("GIT_CONFIG_COUNT", "0") or 0)
+    except ValueError:
+        return env
+    for slot in range(max(count, 0)):
+        if env.get("GIT_CONFIG_KEY_%d" % slot) == key:
+            env["GIT_CONFIG_KEY_%d" % slot] = _INERT_SETTING_NAME
+            env["GIT_CONFIG_VALUE_%d" % slot] = "1"
+    return env
+
 WORKSPACE_DIRNAME = ".chamnan"
 # Each part can be switched off independently. Nothing here is load-bearing for the others: turning
 # `map` off leaves state and skills working, and vice versa. That is deliberate — the parts have
@@ -164,8 +294,9 @@ DEFAULT_CONFIG = {
     # who does not reach it. Measured the same afternoon: chamnan's own repository emits 4,180
     # bytes against the identical ceiling, and a workspace with two files emits about 1,300.
     #
-    # The owner's wording, 2026-09-14: *"ตั้งเป็นค่ามาตรฐานไปก่อน 9500 แต่คุมว่าเฉพาะใช้งานจริง ไม่ใช่ค่าตายตัว
-    # ใครใช้ไม่ถึงก็คิดตามจริง"*.
+    # The owner's instruction, 2026-09-14: make 9,500 the standard for now, but charge only what is
+    # actually used rather than treating it as a fixed cost -- anyone who does not reach it is
+    # billed for what they really emit.
     "output_byte_ceiling": 9500,
     # The rules section's own budget, in characters. It had none until 2026-09-09 and was fixed at
     # 1,500 from a day when this repository had one rule; the two sections beside it in the block
@@ -249,7 +380,7 @@ DEFAULT_CONFIG = {
     # `.chamnan/config.json`, not sniffed" -- and it was not a key here, so `load_config()`'s
     # allowlist dropped it before `profiles.resolve()` ever saw it. Setting it in the file the
     # module names did precisely nothing, silently; only the environment variable worked, and the
-    # module does not mention one (R8 agent 4). The two budget keys beside it still WIN over the
+    # module does not mention one (R8 agent 4, 2026-09-06). The two budget keys beside it still WIN over the
     # profile when set by hand, which `resolve()` documents and does not change.
     "context_profile": "standard",
 }
@@ -257,13 +388,13 @@ DEFAULT_CONFIG = {
 # every store here is listed by globbing `*.md`. In this workspace `.chamnan/skills/README.md` sorts
 # second of twenty, so with a twelve-slot listing it took a real skill's place — and it was described
 # to the model by its own first prose line, which explains what the folder is rather than what a
-# procedure does (R8 agent 5). One predicate rather than a check at each listing, because there are
+# procedure does (R8 agent 5, 2026-09-06). One predicate rather than a check at each listing, because there are
 # eight of those and this is exactly the shape this repository keeps rediscovering.
 # 🐛 [2026-09-06] Every retention pass computes its cutoff from `time.time()`, and nothing bounds
 # what happens when that value is wrong. Reproduced with a 400-day forward jump — an NTP correction
 # or a dead RTC battery, not an exotic input: `prune_logs` and `sessions.prune` each deleted a file
 # written SECONDS earlier, and `expiring_logs`, the warning that exists to give notice, is computed
-# from the same broken clock and gives none (R10 agent 2).
+# from the same broken clock and gives none (R10 agent 2, 2026-09-06).
 #
 # There is no way to tell a jumped clock from real age using the clock that jumped. So the rule is
 # not about the clock at all: a retention pass never empties a store. Whatever it believes about
@@ -365,7 +496,7 @@ def workspace(root=None):
 # `rules_char_budget` was in `_UPPER_BOUND` and not here — so its declared ceiling of 20,000 never
 # ran and `_in_range("rules_char_budget", 500000)` answered True. A bound that is declared and never
 # consulted is the same shape as the environment ceiling fixed the day before: the number is written
-# down, it looks enforced, and nothing checks it (R10 agent 5, finding 5).
+# down, it looks enforced, and nothing checks it (R10 agent 5, 2026-09-10, finding 5).
 #
 # `state_stale_days` was worse and the report did not name it: in NEITHER tuple, so no bound and no
 # type check at all. Every numeric key a real config carries is in both now, and a check asserts the
@@ -512,7 +643,7 @@ def enabled(part, root=None):
 # firings, and the evidence base for every question about what the block costs — and the second is
 # what lets the release gate say "4,613 checks — was 4,605" instead of a bare number nobody can
 # compare. A week without a session on a repository is not unusual, and neither file announces its
-# own deletion (R4 agent 3, findings 3 and 4).
+# own deletion (R4 agent 3, 2026-09-10, findings 3 and 4).
 #
 # The reason it was missed is worth keeping: `blocklog` declares its path as `"logs/block_shape.jsonl"`
 # — WITH the directory — so a search for a bare `"*.jsonl"` filename literal walks straight past it.
@@ -580,6 +711,15 @@ SELF_PRUNING_LOGS = ("commands.jsonl", "pointer.jsonl", "scratch.jsonl", "edits.
                     # forever, every week — which is precisely what `notice_due`'s own docstring
                     # says it exists to prevent: "advice that repeats forever is worse than advice
                     # shown once." A count of showings is a record of when something happened.
+                    # 🐛 [2026-09-18] (self-measured) One row per long document opened directly instead of
+                    # through the local model, which is the DENOMINATOR of the rule this package
+                    # keeps breaking: the ledger counts the reads that went to Local, and until
+                    # this file existed nothing counted the ones that did not, so the figure was a
+                    # numerator with nothing to divide by and read green on three calls while
+                    # twelve documents were opened by hand. Bounded by record like the rest. An
+                    # age sweep on it would erase the only evidence that the rule was ignored,
+                    # which is the one thing this measurement exists to make visible.
+                    "long_reads.jsonl",
                     "nudge_state.json")
 
 
@@ -654,7 +794,7 @@ def _pid_is_alive(pid):
     file between those two and the write is lost -- the destination keeps its old content, which is
     the atomicity working, and the NEW content is simply gone. The comment above says "both bounds
     have to be wrong before this can touch a write in progress", and the second bound was the
-    NAME's shape, which a live writer's staging file matches exactly (R10 agent 2).
+    NAME's shape, which a live writer's staging file matches exactly (R10 agent 2, 2026-09-06).
 
     So the second bound becomes one the clock cannot move: the filename already carries the PID
     that wrote it. A recycled PID means an orphan lingers until that unrelated process exits, and
@@ -712,6 +852,105 @@ def _pid_is_alive(pid):
         return True                       # exists, owned by somebody else
     except OSError:
         return True
+
+
+def _process_started(pid, run=None):
+    """The moment `pid` was born, as a string that never changes, or "" when it cannot be known.
+
+    \U0001f3af The owner's fix for pid reuse, sharpened by one step. They proposed recording how long
+    the app had been running and adding the wait to it — right in substance, and it needs a
+    tolerance, because "3h now, so 5h10m later" only holds if nothing distorted the clock. A BIRTH
+    TIME needs no tolerance at all: it never moves, so it is compared exactly. That matters on this
+    machine specifically, which sleeps after one idle minute — elapsed time keeps counting while it
+    does, so a wait across a suspend produces an elapsed figure nobody predicted, while the birth
+    time is the same string it always was.
+
+    \U0001f41b [2026-09-12] The first version shelled out to `ps` on POSIX and `powershell` on Windows,
+    and the gate refused it — correctly, and for a reason worth keeping. The README tells anyone
+    auditing this package that it executes exactly two things: `git`, and this interpreter re-running
+    a file that ships inside it. Adding `ps` would have been a third, which is a change to a promise
+    made to users, not an implementation detail. It would also have cost a process spawn — about
+    21ms each on this machine — for a question the kernel answers directly.
+
+    So all three platforms are read through the OS, with no child process at all:
+      Linux   `/proc/<pid>` exists and its ctime IS the moment the process was created.
+      macOS   `libproc.proc_pidinfo` with PROC_PIDTBSDINFO carries `pbi_start_tvsec`.
+      Windows `GetProcessTimes` on an opened handle gives creation time directly.
+    `run` stays in the signature so a test can inject a failure without a platform to fail on.
+
+    \U0001f3af Moved here from `schedule.py` (2026-09-18): `exclusive()`'s lock needs the identical
+    answer for the identical reason — a pid alone is reused, after a reboot or after enough process
+    churn — and `_pid_is_alive` has been this package's one answer to pid liveness all along.
+    `schedule.process_started` is now a thin delegating wrapper; see `_own_process_started` below
+    for the cached form `exclusive()` actually calls.
+    """
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return ""
+    if pid <= 0:
+        return ""
+    if run is not None:                       # a test speaking for the platform
+        return str(run(pid) or "")
+    try:
+        if sys.platform.startswith("linux"):
+            return "%.6f" % pathlib.Path("/proc/%d" % pid).stat().st_ctime
+        if sys.platform == "darwin":
+            import ctypes
+            # PROC_PIDTBSDINFO is 1; the struct's `pbi_start_tvsec` sits at offset 120 and the
+            # call returns the bytes written, so a short answer is a failure rather than a value.
+            libc = ctypes.CDLL("libc.dylib", use_errno=True)
+            # The signature is declared. Without it ctypes guesses, and the guess is wrong here in
+            # two ways at once: the flavor argument arrives the wrong width and the return is
+            # truncated, so the first draft read 24 bytes of a file-descriptor list and turned it
+            # into a plausible-looking number. Verified against `ps -o lstart=` on two live
+            # processes before being trusted — the same rule the ID fixtures are held to.
+            libc.proc_pidinfo.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_uint64,
+                                          ctypes.c_void_p, ctypes.c_int]
+            libc.proc_pidinfo.restype = ctypes.c_int
+            buf = ctypes.create_string_buffer(1024)
+            # PROC_PIDTBSDINFO is 3, not 1 — 1 is PROC_PIDLISTFDS, which answers a different
+            # question and answers it successfully, which is why the wrong flavor read as data.
+            written = libc.proc_pidinfo(pid, 3, 0, buf, 1024)
+            if written < 128:
+                return ""
+            # `pbi_start_tvsec` at offset 120 of struct proc_bsdinfo.
+            return "%d" % int.from_bytes(buf.raw[120:128], "little")
+        if os.name == "nt":
+            import ctypes
+            from ctypes import wintypes
+            k32 = ctypes.WinDLL("kernel32", use_errno=True)   # noqa: F821 — Windows only
+            handle = k32.OpenProcess(0x1000, False, pid)      # QUERY_LIMITED_INFORMATION
+            if not handle:
+                return ""
+            try:
+                created = wintypes.FILETIME()
+                rest = [wintypes.FILETIME() for _ in range(3)]
+                if not k32.GetProcessTimes(handle, ctypes.byref(created),
+                                           *[ctypes.byref(x) for x in rest]):
+                    return ""
+                return "%d" % ((created.dwHighDateTime << 32) | created.dwLowDateTime)
+            finally:
+                k32.CloseHandle(handle)
+    except (OSError, ValueError, AttributeError, TypeError):
+        return ""
+    return ""
+
+
+# This process's own start time, cached — [] empty until first call, then a single string. A
+# process's birth time cannot change during its own lifetime, so the cache is sound for as long as
+# the interpreter runs. Load-bearing: `_process_started(os.getpid())` costs 99.5 µs measured on
+# this machine against an uncontended `exclusive()` acquire of 224 µs, so calling it uncached on
+# every acquire would be +44% on a path `record_call` takes on every Bash call. One call per
+# process lifetime instead.
+_OWN_PROCESS_STARTED = []
+
+
+def _own_process_started():
+    """This process's own start time, computed once and cached for the rest of its life."""
+    if not _OWN_PROCESS_STARTED:
+        _OWN_PROCESS_STARTED.append(_process_started(os.getpid()))
+    return _OWN_PROCESS_STARTED[0]
 
 
 def prune_orphaned_temps(root=None):
@@ -822,7 +1061,7 @@ def prune_logs(root=None):
     # days`), and so does `state_stale_days` (`state.py`: "days <= 0 disables the whole pass") and
     # the ledger's own window. Here it made `cutoff` equal to NOW, so every log older than this
     # instant was deleted — a user writing 0 to mean "keep everything", the reading three of the
-    # four places already have, lost the lot (R8 agent 4). Three against one is not a design, it is
+    # four places already have, lost the lot (R8 agent 4, 2026-09-06). Three against one is not a design, it is
     # an omission; this is the one that was out of step.
     if not days or days <= 0:
         return 0
@@ -860,7 +1099,7 @@ def prune_logs(root=None):
             # it only ever compares against one number. A 409 MB, 6,870-file scratch directory that
             # an earlier research round left here cost 120 ms of EVERY SessionStart firing on this
             # repository -- 34% of the hook's 349 ms -- and the directory was fresh, so the walk
-            # could have stopped on its first file (R12 agent 1). Third occurrence of this shape:
+            # could have stopped on its first file (R12 agent 1, 2026-09-06). Third occurrence of this shape:
             # the two above it are named in this same function's comments.
             #
             # One fresh file is the whole answer, so the loop stops at it. A directory being written
@@ -943,7 +1182,7 @@ def hook_root(payload=None):
         # `never_fail` below, on the stated reasoning that it "has something partial worth
         # emitting". It has nothing partial to emit when it dies on its first line. The reasoning is
         # sound and the crash simply happened before it could apply, so the fix is here, where a
-        # malformed payload becomes "no candidate" rather than an exception (R7 agent 9).
+        # malformed payload becomes "no candidate" rather than an exception (R7 agent 9, 2026-09-07).
         #
         # Not `str(c)`: that would turn `{"a": 1}` into a directory name and search for it. A value
         # of the wrong type carries no path, and the next candidate — or `find_root()` — is the
@@ -970,7 +1209,7 @@ def hook_root(payload=None):
     # resume pointer and no `STATE.md` for the nested repository, for as long as the session was
     # opened from the parent, which is how this project's own dogfood shape is normally used. The
     # read side already knows about this — `chamnan_subagent_start.py` names nested checkouts and
-    # says to use that one if the work is in there — and the write side did not (R1 agent 3).
+    # says to use that one if the work is in there — and the write side did not (R1 agent 3, 2026-09-09).
     #
     # A nested workspace wins over the one enclosing it, because filing one project's session data
     # into another project's workspace mixes two repositories with nothing saying so. Order is
@@ -1243,7 +1482,7 @@ def ensure(root=None):
     #
     # And it is a read-modify-write on a file every command and hook touches at startup, so it
     # needs the lock as well as the atomicity: `merged` is computed from a snapshot of `current`,
-    # and two sessions opening together each merge into their own snapshot (R7 agent 5).
+    # and two sessions opening together each merge into their own snapshot (R7 agent 5, 2026-09-07).
     malformed = bool(_config_problem(cfg))
 
     def _merged(text):
@@ -1273,7 +1512,7 @@ def ensure(root=None):
         # one `chamnan-map` from v1.4.0 — nine keys gone in a single call, silently, including the
         # one `fit.py`'s own comment calls security-relevant because it keeps the block under the
         # host's truncation. Running HEAD again "restored" it to the DEFAULT 9000, so the value the
-        # user chose was gone for good and nothing at any point said so (R7 agent 6).
+        # user chose was gone for good and nothing at any point said so (R7 agent 6, 2026-09-07).
         #
         # `.version` already records the newest build that has touched this workspace, for exactly
         # this class of question, so the evidence needed was on disk and unused. When it names a
@@ -1388,7 +1627,7 @@ def _mark_generated(root):
         # processes doing that at once each saw the same empty file and each appended the whole
         # block, so the content TRIPLED under three. Both self-repairs in this module had it, and
         # both are called from `ensure()`, which every command and every hook runs at startup: two
-        # sessions opening together is the ordinary way to hit it, not a contrived one (R7 agent 5).
+        # sessions opening together is the ordinary way to hit it, not a contrived one (R7 agent 5, 2026-09-07).
         #
         # The read has to be inside the lock, so the whole read-decide-append becomes one locked
         # rewrite. Append semantics are preserved exactly — whatever is in the file stays, and only
@@ -2160,7 +2399,7 @@ def atomic_write_text(dest, text, encoding="utf-8"):
         # 🐛 [2026-09-06] The reason was caught here and thrown away, so every caller could say was
         # "could not write X". Reproduced live with `chmod 444` and `chmod 555`: a read-only FILE, a
         # read-only DIRECTORY and a full disk all produced the identical sentence, and the first two
-        # need different fixes (R15 agent 3). The bool return stays the contract -- every caller
+        # need different fixes (R15 agent 3, 2026-09-06). The bool return stays the contract -- every caller
         # tests it -- so the reason goes in a module-level slot the raising wrapper reads, the same
         # shape `LAST_UNREAD` already uses for the read ceiling.
         LAST_WRITE_ERROR[:] = [f"{type(err).__name__}: {err}"]
@@ -2184,7 +2423,7 @@ def write_or_raise(dest, text, encoding="utf-8"):
     named two paragraphs above -- `chamnan-timeline new` printing "declared -- .chamnan/threads/
     a-thread.md" with no file on disk -- was fixed only in this function's own return value; the
     caller went on discarding it, so the same output came back for a read-only directory, a full
-    disk, and the staging-file race in `prune_orphaned_temps` (R10 agent 2).
+    disk, and the staging-file race in `prune_orphaned_temps` (R10 agent 2, 2026-09-06).
 
     The line is the one `tools_index._save`'s comment already draws: a log line, a pointer, a
     rollup cache is housekeeping and stays silent, because a workspace that cannot be written must
@@ -2265,14 +2504,41 @@ def _lock_holder_state(lock):
     syscalls, so "names nobody" is also what a perfectly healthy holder looks like for a few
     microseconds — breaking on that would hand the same file to two writers, which is the one
     thing this mutex exists to prevent.
+
+    🐛 [2026-09-18] (R27.7) The PID alone answers "does SOMETHING with this number exist", not "does the
+    process that wrote this lock still exist" — a PID is reused, after a reboot or after enough
+    process churn, and a lock left by a crashed holder whose PID has since been handed to an
+    unrelated live process then reads as ALIVE forever, which is exactly what let the age rule at
+    `LOCK_STALE` never fire. The lock's SECOND line, when there is one, is the birth time the
+    holder recorded for its own PID at write time (see `exclusive()`); the two bounds now split
+    the question:
+      - PID not alive                                          → DEAD, as before.
+      - PID alive, no second line                               → ALIVE, as before — an older
+        version wrote this lock and there is nothing more to check.
+      - PID alive, second line present, `_process_started(pid)` disagrees with it → DEAD: the
+        number is alive, but it is not the process that wrote this lock.
+      - PID alive, second line present, `_process_started(pid)` returns "" (this platform cannot
+        answer) → ALIVE. Never inferred DEAD from an absent or unreadable start time; DEAD only
+        follows from two values that are both present and disagree. A false ALIVE costs waiting;
+        a false DEAD unlinks a live holder's lock and hands the file to two writers at once, which
+        is strictly worse than the bug this exists to fix.
     """
     try:
-        first = lock.read_text(encoding="utf-8", errors="replace").strip().splitlines()
+        lines = lock.read_text(encoding="utf-8", errors="replace").strip().splitlines()
     except OSError:
         return LOCK_HOLDER_UNKNOWN
-    if not first or not first[0].strip().isdigit():
+    if not lines or not lines[0].strip().isdigit():
         return LOCK_HOLDER_UNKNOWN
-    return LOCK_HOLDER_ALIVE if _pid_is_alive(int(first[0].strip())) else LOCK_HOLDER_DEAD
+    pid = int(lines[0].strip())
+    if not _pid_is_alive(pid):
+        return LOCK_HOLDER_DEAD
+    recorded_start = lines[1].strip() if len(lines) > 1 else ""
+    if not recorded_start:
+        return LOCK_HOLDER_ALIVE
+    actual_start = _process_started(pid)
+    if actual_start and actual_start != recorded_start:
+        return LOCK_HOLDER_DEAD
+    return LOCK_HOLDER_ALIVE
 
 
 @contextlib.contextmanager
@@ -2306,9 +2572,15 @@ def exclusive(path):
             # forward clock jump inverted a bound. Skew the clock by more than 30 seconds and a
             # second process reads a lock a live process is still holding as abandoned, unlinks it
             # and takes it -- so the mutex hands the same shared file to two writers at once, which
-            # is exactly the lost update it exists to prevent (R11 agent 2).
+            # is exactly the lost update it exists to prevent (R11 agent 2, 2026-09-18).
+            #
+            # 🐛 [2026-09-18] (R27.7) The PID alone is reused -- after a reboot, or after enough process
+            # churn -- so a lock left by a holder that CRASHED reads as ALIVE forever once its PID
+            # is handed to an unrelated live process, and the age rule can never break it. The
+            # second line is this process's own birth time, cached in `_own_process_started` so
+            # paying for it happens once per process lifetime rather than on every acquire.
             try:
-                os.write(fd, f"{os.getpid()}\n".encode())
+                os.write(fd, f"{os.getpid()}\n{_own_process_started()}\n".encode())
             except OSError:
                 pass
             break
@@ -2379,6 +2651,28 @@ def exclusive(path):
         # The ubuntu column of the same run raised it zero times, which is why POSIX never saw this.
         except PermissionError:
             # DELETE-PENDING is progress by definition: the previous holder is on its way out.
+            #
+            # 🐛 [2026-09-19] (self-measured) That is true on WINDOWS, which is what the measurement above is
+            # about, and false everywhere else. On POSIX a PermissionError here means EACCES on the
+            # directory — a permission that will not change while this process runs — so the retry
+            # spun for the full LOCK_WAIT_MAX of 30 seconds and then gave up, once per shared file.
+            # `chamnan_session_start.py` therefore never answered at all with `.chamnan` unreadable:
+            # reproduced at over 45 seconds with no output on either stream, and a hook's stderr
+            # does not reach the transcript, so the user sees a session start wrong with nothing
+            # saying why.
+            #
+            # It was invisible because the check that asks "does any hook take a session down"
+            # had no timeout on the subprocess it was driving, so it hung alongside the hook
+            # instead of reporting it. Two unbounded waits, one inside the other.
+            # 🐛 [2026-09-19] (self-measured) Read from a module flag rather than `os.name`, so a
+            # test can exercise the Windows branch on this machine. Patching `os.name` itself does
+            # work here — and then `pathlib` builds a `WindowsPath` for every `Path()` made while
+            # the patch is in place and raises `UnsupportedOperation`. It took the whole gate down
+            # with no totals line, which is the shape this project treats as "not a pass" rather
+            # than as a failure, because a crashed run prints no FAIL lines at all.
+            if not _IS_WINDOWS:
+                LOCK_GIVEUPS["permission_denied"] = LOCK_GIVEUPS.get("permission_denied", 0) + 1
+                break
             now = time.time()
             deadline = now + LOCK_TIMEOUT
             if now - started > LOCK_WAIT_MAX:
@@ -2511,7 +2805,7 @@ def git_hooks_dir(root):
     🐛 [2026-09-06] Lived in `bin/chamnan-map` as a private function, so the only code that could
     ask "is the hook installed" was the code that installs it -- and nothing ever asked. A
     repository whose index quietly goes stale on every commit looks exactly like one whose hook is
-    working (R14 agent 5). Moved here so the report can ask the same question the installer does,
+    working (R14 agent 5, 2026-09-06). Moved here so the report can ask the same question the installer does,
     with the same three subtleties handled, rather than checking `.git/hooks/pre-commit` and being
     wrong in all three.
     """
@@ -2521,7 +2815,7 @@ def git_hooks_dir(root):
     try:
         out = sp.run(["git", "-C", str(root), "rev-parse", "--git-path", "hooks"],
                      capture_output=True, text=True, encoding="utf-8",
-                     errors="replace", timeout=10)
+                     errors="replace", timeout=10, env=_env_reading("core.hooksPath"))
         if out.returncode == 0 and out.stdout.strip():
             found = pathlib.Path(out.stdout.strip())
             return found if found.is_absolute() else (pathlib.Path(root) / found)
@@ -2536,7 +2830,7 @@ def git_hooks_dir(root):
 # `chamnan-context --write` refresh loop and both bug fixes made to it since, so it rebuilt the map
 # and refreshed no adapter file at all. `--install-git-hook` printed "already installed" and
 # changed nothing, and the session-start warning stayed silent, because both asked only whether the
-# marker was there. A repository that installed it once runs that version forever (R5 agent 5).
+# marker was there. A repository that installed it once runs that version forever (R5 agent 5, 2026-09-09).
 #
 # The stamp is eight hex of a hash of the body, written into the marker line at install and
 # compared on every ask. Short on purpose: this answers "is it the same text", and a full digest in
@@ -2604,6 +2898,30 @@ def wants_version(argv):
     typing it and getting "unknown flag" is worse than useless.
     """
     return any(a in VERSION_FLAGS for a in (argv or []))
+
+
+def reader_is_a_terminal(stream=None):
+    """True when a person is watching this output, false when it is being captured.
+
+    🎯 [R5, 2026-09-18] Measured: `chamnan-report` prints about 3,850 tokens — more than the entire
+    session-start block, whose ceiling is 9,500 BYTES — and every other command is under 400. Whoever
+    runs it at a terminal wants that table. A dispatched agent, which is never a TTY, pays for it on
+    every turn of the session afterwards, and cannot skim.
+
+    Until now every reader got identical bytes: there was no `isatty` call anywhere in `lib/` or
+    `bin/`. `gh` switches to tab-delimited fields, stops truncating and drops colour on the same
+    test, with no flag to pass and nothing to document — which is the property that matters here,
+    because a flag only helps the caller who already knew to use it.
+
+    Errors are answered False rather than raised: a stream with no `isatty` (a pipe replacement, a
+    captured buffer in a test) is not a person, and an output decision must never be the reason a
+    command fails.
+    """
+    stream = sys.stdout if stream is None else stream
+    try:
+        return bool(stream.isatty())
+    except (AttributeError, ValueError, OSError):
+        return False
 
 
 def nonce_for(session_id):
@@ -2708,7 +3026,7 @@ def unknown_flags(argv, known, takes_value=(), takes_rest=()):
     have: every VALUE was read as a flag, so `chamnan-promote --desc "-n means dry run"` would have
     been refused for the value it was given. That is why `takes_value` and `takes_rest` exist —
     the helper had to learn the shape of a value before the set could adopt it, and adopting it in
-    three commands and stopping is how this project produces its commonest defect (R7 agent 4).
+    three commands and stopping is how this project produces its commonest defect (R7 agent 4, 2026-09-08).
 
     `takes_value` names flags whose NEXT argument is a value: `--budget 400`, `--platform "..."`.
     `takes_rest` names flags that swallow everything after them: `--desc` takes the rest of the
@@ -2835,7 +3153,7 @@ def git_is_installed():
     and every caller treats both as "nothing to say". For the first that is right; for the second it
     is a silent failure in a plugin whose whole session block is built out of git — "Where the last
     session stopped" simply vanished, with no diagnostic anywhere, and the user is left thinking
-    chamnan has nothing to tell them rather than that it cannot look (R10 agent 1).
+    chamnan has nothing to tell them rather than that it cannot look (R10 agent 1, 2026-09-07).
     """
     global _GIT_ON_PATH
     if _GIT_ON_PATH is None:
@@ -2845,7 +3163,7 @@ def git_is_installed():
         # shipped 1.8.3.1 for years. On such a machine this returned True, the diagnostic added
         # this morning for "git is missing" therefore never fired, and every git-derived section
         # went silent with nothing anywhere saying why — which is the exact failure that
-        # diagnostic exists to prevent, reached by the other half of the same set (R13 agent 1).
+        # diagnostic exists to prevent, reached by the other half of the same set (R13 agent 1, 2026-09-07).
         #
         # So the question is not "is git here" but "can git answer the way this package asks", and
         # the only honest way to know is to ask it once.
@@ -2866,6 +3184,36 @@ def git_is_installed():
 _GIT_ON_PATH = None
 
 
+_GIT_TOPLEVEL_PROBE = {}
+
+
+def _git_toplevel_probe(root):
+    """Run `git -C root rev-parse --show-toplevel` once per resolved root and memoise the raw
+    subprocess result — returncode, stdout, stderr — for every caller that asks this exact
+    question.
+
+    `git_toplevel`, `git_can_speak_for` and `git_owns` each run this identical command today and
+    read the result three different ways; this is the one subprocess they share, not the three
+    interpretations, which stay in each function unchanged. A failure to run at all is memoised as
+    None, so an exception can never be mistaken for a cached success. Only `git_cannot_answer()` is
+    caught here — the same set each of the three callers already caught around this exact call —
+    so a caller that used to catch something wider around its own subprocess call still does,
+    because the exception simply propagates out of this one instead.
+    """
+    key = str(Path(root).resolve())
+    if key in _GIT_TOPLEVEL_PROBE:
+        return _GIT_TOPLEVEL_PROBE[key]
+    result = None
+    try:
+        result = _subprocess().run(["git", "-C", str(root), "rev-parse", "--show-toplevel"],
+                                   stdin=_subprocess().DEVNULL, capture_output=True, text=True,
+                                   encoding="utf-8", errors="replace", timeout=10)
+    except git_cannot_answer():
+        result = None
+    _GIT_TOPLEVEL_PROBE[key] = result
+    return result
+
+
 def git_toplevel(root):
     """The working-tree root of the repository `root` belongs to, or None when there is none.
 
@@ -2873,13 +3221,10 @@ def git_toplevel(root):
     False has two very different meanings — "no repository anywhere" and "a repository, higher up"
     — and a message that does not tell them apart sends the reader to check the wrong thing.
     """
-    try:
-        out = _subprocess().run(["git", "-C", str(root), "rev-parse", "--show-toplevel"],
-                                stdin=_subprocess().DEVNULL, capture_output=True, text=True,
-                                encoding="utf-8", errors="replace", timeout=10)
-        return (out.stdout.strip() or None) if out.returncode == 0 else None
-    except git_cannot_answer():
+    out = _git_toplevel_probe(root)
+    if out is None:
         return None
+    return (out.stdout.strip() or None) if out.returncode == 0 else None
 
 
 _GIT_SPEAKS = {}
@@ -3064,10 +3409,8 @@ def git_can_speak_for(root):
     if key in _GIT_SPEAKS:
         return _GIT_SPEAKS[key]
     answer = False
-    try:
-        out = _subprocess().run(["git", "-C", str(root), "rev-parse", "--show-toplevel"],
-                                stdin=_subprocess().DEVNULL, capture_output=True, text=True,
-                                encoding="utf-8", errors="replace", timeout=10)
+    out = _git_toplevel_probe(root)
+    if out is not None:
         # A git too old for `-C` fails on the OPTION, not on the directory — "unknown option"
         # rather than "not a repository". Recorded here because this is the first `git -C` any
         # session makes, so the answer costs nothing beyond the call already being made.
@@ -3077,8 +3420,6 @@ def git_can_speak_for(root):
         answer = out.returncode == 0 and bool(out.stdout.strip())
         if not answer:
             answer = git_owns(root)          # a bare repository, which has no working tree
-    except git_cannot_answer():
-        answer = False
     _GIT_SPEAKS[key] = answer
     return answer
 
@@ -3099,10 +3440,10 @@ def git_owns(root):
         return _GIT_OWNS[key]
     answer = False
     try:
-        out = _subprocess().run(["git", "-C", str(root), "rev-parse", "--show-toplevel"],
-                                capture_output=True, text=True, encoding="utf-8",
-                                errors="replace", timeout=10)
-        if out.returncode == 0 and out.stdout.strip():
+        out = _git_toplevel_probe(root)
+        if out is None:
+            answer = False
+        elif out.returncode == 0 and out.stdout.strip():
             answer = Path(out.stdout.strip()).resolve() == Path(root).resolve()
         else:
             # No working tree: a bare repository is still "this directory IS the repository", and
@@ -3111,7 +3452,7 @@ def git_owns(root):
             # so a git from the 1.8.5-2.12 range — Ubuntu 14.04 and 16.04 shipped one — has the
             # flag this function is called with and not the flag this branch uses. It answered
             # False for a bare repository that git itself resolves, silently. `--git-dir` is as old
-            # as git and gives the same answer once resolved against `root` (R13 agent 1).
+            # as git and gives the same answer once resolved against `root` (R13 agent 1, 2026-09-07).
             bare = _subprocess().run(
                 ["git", "-C", str(root), "rev-parse", "--absolute-git-dir"],
                 capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=10)
