@@ -1,5 +1,5 @@
 {
-  "version": "1.29.0",
+  "version": "1.30.0",
   "modules": [
     "assets.py",
     "catalogs.py",
@@ -9,8 +9,10 @@
     "md.py",
     "mdblock.py",
     "memory.py",
+    "pointer.py",
     "redact.py",
     "rollup.py",
+    "rulecheck.py",
     "schema.py",
     "sessions.py",
     "state.py",
