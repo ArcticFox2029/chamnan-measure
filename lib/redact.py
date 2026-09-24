@@ -1078,9 +1078,19 @@ BLOCKED_SUFFIXES = (
 # `.pgpass` and `pgpass.conf` are libpq's password file in its two spellings, and every line in one
 # ends with the password in clear. All four are credential stores whose whole content is the secret,
 # which is the property this list is for — not "a file that might contain one".
+# 🐛 [2026-09-23] (self-measured) `secrets.yml` and `secrets.yaml` were named one by one, so `secrets.toml` —
+# the file Streamlit puts live API keys in, and the one this very repository keeps them in — was
+# not refused. Two members of a set were fixed and the identical ones beside them were not, which
+# is this project's most repeated defect and the reason the entry is now the STEM.
+#
+# `credentials` is already handled that way and shows why it is safe: `_is_blocked_name` blocks a
+# bare stem only when the name does not end in a SOURCE extension, so `secrets.toml`, `.json`,
+# `.ini`, `.yaml`, `.yml` and a bare `secrets` are all refused while `secrets.py` and `secrets.ts`
+# stay ordinary modules. Only the leaf name is judged, so a directory called `secrets/` is
+# untouched and the files inside it are each judged on their own.
 BLOCKED_NAMES = ("id_rsa", "id_dsa", "id_ecdsa", "id_ed25519", ".htpasswd", ".netrc", "_netrc",
                  ".pgpass", "pgpass.conf",
-                 "credentials", "secrets.yml", "secrets.yaml")
+                 "credentials", "secrets")
 
 # The scanner's list above and this one answer different questions. The scanner should not open a
 # database at all -- it indexes source, and a .sqlite is not source. peek is asked for one file by
@@ -1346,7 +1356,7 @@ def _looks_like_a_credential_name(key, value=None):
         return True
     # 🐛 The tail decided alone, so ~50 ordinary endings — `id`, `type`, `name`, `field` — exempted
     # the value whatever it was. Reproduced end to end through `bin/chamnan-peek --find`:
-    # `api_secret_id = "AKIAIOSFODNN7EXAMPLE1234"` and `db_password_type = "tr0ub4dor3horsebattery"`
+    # `api_secret_id = "AKIA…EXAMPLE1234"` and `db_password_type = "tr0ub4dor3horsebattery"`
     # printed in full (R12 agent 2, 2026-09-07). The exemption is still needed — `secret_name` and
     # `api_key_path` genuinely name things, and redacting those is the noise that gets a redactor
     # switched off — so the name still decides unless the VALUE settles it.
@@ -1534,7 +1544,7 @@ def _value_overrides_the_name(value, key=""):
         if _NOT_IN_ANY_NAME.search(_bare_value):
             return True
         # Otherwise fall through. The tests below already decide every case this one does not:
-        # `AKIAIOSFODNN7EXAMPLE1234` and `tr0ub4dor3horsebattery` are long, mixed, letters AND
+        # `AKIA…EXAMPLE1234` and `tr0ub4dor3horsebattery` are long, mixed, letters AND
         # digits, with no separator doing the work; `the-name-of-my-secret` has four hyphens and
         # `/etc/keys/prod.pem` has a slash. Replacing them with this clause instead of adding to it
         # cost seven checks in the gate — the two the exemption is FOR kept working and the three it
@@ -1564,7 +1574,7 @@ def _names_a_mechanism(key, value=None):
 
     🐛 It read the key and nothing else, so ~50 ordinary tails — `name`, `id`, `type`, `field`,
     `path` — exempted the value whatever it was. Reproduced end to end through
-    `bin/chamnan-peek --find`: `api_secret_id = "AKIAIOSFODNN7EXAMPLE1234"` and
+    `bin/chamnan-peek --find`: `api_secret_id = "AKIA…EXAMPLE1234"` and
     `db_password_type = "tr0ub4dor3horsebattery"` printed in full (R12 agent 2, 2026-09-07).
     
     The exemption is still right and still needed — `secret_name = "the-name-of-my-secret"` and
@@ -1582,10 +1592,27 @@ def _names_a_mechanism(key, value=None):
     quote correctly. Two helpers, one file, the same job, different normalisation — so they share
     `_bare_key` now.
     """
+    # 🐛 [2026-09-23, found by the grown corpus] `API_KEY=<your-api-key-here>` was redacted by all
+    # SEVEN assignment carriers — bare, quoted, spaced, colon, rocket, flag and YAML block. The
+    # exemption for it existed and was scoped to WEAK key names only, so the commonest line in every
+    # quickstart in every README came back as `API_KEY=<REDACTED>`, which destroys the instruction
+    # it was giving. A value wrapped in angle brackets is a placeholder whatever the key is called:
+    # `<` and `>` are in no issuer's alphabet, and a shell reads `<` as redirection, so a real
+    # credential cannot arrive in that shape. Derived from the delimiters, not from a word list.
+    if _is_an_angle_placeholder(value):
+        return True
     tail = _bare_key(key).rsplit("_", 1)[-1].rsplit("-", 1)[-1]
     if tail not in NAMING_SUFFIXES:
         return False
     return not _value_overrides_the_name(value, key)
+
+
+def _is_an_angle_placeholder(value):
+    """`<anything-without-spaces>` — the README placeholder, under a strong key name or a weak one."""
+    v = (value or "").strip().strip("'\"`")
+    return (len(v) > 2 and v.startswith("<") and v.endswith(">")
+            and "<" not in v[1:-1] and ">" not in v[1:-1]
+            and not any(c.isspace() for c in v))
 
 
 # 🐛 [2026-09-04, R14 agent 2 finding 02, verified before acting] A value that continued past a
@@ -2583,6 +2610,57 @@ def _is_planted_invisible(ch):
     return unicodedata.category(ch) == "Cf" or ch in _INVISIBLE_VARIATION_SELECTORS
 
 
+# A credential broken in half by a source formatter and rejoined by the language, not by us.
+# `("ghp_" "EXAMPLEEXAMPLE…")` is ONE value to Python, C, and every reader; to a pattern list it is
+# a four-character prefix and a harmless word. Both halves are quoted separately, so nothing here
+# anchors on either.
+_SPLIT_JOIN = _lazy(lambda: re.compile(
+    r"""(?<=[A-Za-z0-9_\-])            # the end of the first half
+        (["'])\s*(?:\+\s*)?\1          # "…" "…"  or  "…" + "…", across a newline too
+        (?=[A-Za-z0-9_\-])              # the start of the second""", re.VERBOSE))
+
+
+def _unmask_split_credentials(text):
+    """`text` with adjacent string literals joined, so a value the source splits is seen whole.
+
+    🐛 [2026-09-24] (self-measured) Found by running chamnan over chamnan-corpus, case A9. A deploy key written the
+    way a formatter leaves it -- `("ghp_"\n "EXAMPLEEXAMPLEEXAMPLEEXAMPLE1234")` -- reached
+    `MAP.md` complete, because every prefix rule in this module requires the prefix and the body to
+    be CONTIGUOUS and here they are two quoted strings. The file the plugin encourages committing
+    published a GitHub token with a quote-space-quote in the middle of it, which anybody reading it
+    reassembles without noticing they did.
+
+    The same contract as the two disguises above, and for the same reason: joining is a change to
+    the reader's text, so `scrub` keeps the result only when it actually redacts MORE. That is what
+    lets this rule be shaped broadly -- it undoes an ordinary, extremely common source construct --
+    without the false positives a broad rule would otherwise cost. A line of prose containing
+    `"a" "b"` is rewritten and then thrown away, because nothing in it matched.
+    """
+    if '"' not in text and "'" not in text:
+        return text
+    joined = _SPLIT_JOIN.sub("", text)
+    if joined == text:
+        return text
+    # 🐛 [2026-09-24] (self-measured) The first form handed the joined text to `scrub` and kept it
+    # whenever it redacted MORE, which is the contract the two disguises above use — and that is
+    # too loose for a rule that rewrites ordinary source. Joining `_REQUIRES_KEY = "chamnan-" +
+    # "canonical"` produces `_REQUIRES_KEY = "chamnan-canonical"`, the NAME-based assignment rule
+    # fires on `_KEY =`, and a constant in this package's own `lib/canonical.py` came out redacted.
+    # The self-scan check caught it in the same gate run that this rule shipped in.
+    #
+    # So the join is accepted only when it makes a VENDOR-SHAPED pattern match — the prefixed
+    # families in `PATTERNS` and `LATE_PREFIXES`, which is the case this exists for: `("ghp_"
+    # "EXAMPLE…")` is a GitHub token whichever way the source wrote it. A name-based rule firing
+    # on the joined form is not evidence that the source split a credential; it is evidence that
+    # the variable is called `key`, which was already true before anything was joined.
+    for _pat in PATTERNS + LATE_PREFIXES:
+        if _pat is DELIMITED_AFTER_SECRET_WORD or _pat is AUTH_SCHEME_SECRET:
+            continue                  # name-based, not a vendor shape — see above
+        if _pat.search(joined) and not _pat.search(text):
+            return joined
+    return text
+
+
 def _unmask_invisible_secret_words(text):
     """`text` with ONLY the credential words an invisible codepoint is splitting rewritten whole.
 
@@ -2768,6 +2846,15 @@ def scrub(text, windowed=True, *, _unmask=True):
             _with = scrub(_destripped, windowed, _unmask=False)
             _without = scrub(text, windowed, _unmask=False)
             return _with if _with.count(PLACEHOLDER) > _without.count(PLACEHOLDER) else _without
+        # A third disguise, same contract again: the value is not spelled oddly and nothing is
+        # hidden inside it -- the SOURCE simply wrote it as two adjacent string literals. Checked
+        # last because it is the only one of the three that rewrites text outside a credential
+        # name, so it gets to run only when neither of the others found anything to undo.
+        _joined = _unmask_split_credentials(text)
+        if _joined is not text and _joined != text:
+            _with = scrub(_joined, windowed, _unmask=False)
+            _without = scrub(text, windowed, _unmask=False)
+            return _with if _with.count(PLACEHOLDER) > _without.count(PLACEHOLDER) else _without
     text = _redact_kubernetes_secret_data(text)
     for pattern in PATTERNS + [DELIMITED_AFTER_SECRET_WORD] + LATE_PREFIXES:
         # A pattern with one group keeps everything outside it: "Bearer <REDACTED>" stays readable
@@ -2848,7 +2935,11 @@ def scrub(text, windowed=True, *, _unmask=True):
     # (38 secrets, 30 decoys) before and after — identical results, not merely a similar score.
     if "=>" in text:
         text = ROCKET_SECRET.sub(
-            lambda m: m.group(0) if _names_a_mechanism(m.group(1), m.group(2))
+            # 🐛 [2026-09-23] (self-measured) This passed group(2) — the QUOTE CHARACTER — as the value, so every
+            # value-side question `_names_a_mechanism` asks was being asked about `'`. The value is
+            # group 3. Found by the placeholder exemption failing in exactly two of the seven
+            # carriers, which is how a value-blind guard shows itself at all.
+            lambda m: m.group(0) if _names_a_mechanism(m.group(1), m.group(3))
             else f"{m.group(1)}{m.group(2)}{PLACEHOLDER}{m.group(2)}", text)
     # 🐛 The first version of this gate tested `"|" in text or ">" in text`, which is TRUE on any
     # markdown document — a table uses `|` and a blockquote uses `>` — so it skipped nothing and the
@@ -2874,6 +2965,9 @@ def scrub(text, windowed=True, *, _unmask=True):
              f"{_structure_the_value_did_not_open(m, m.group(2))}", chunk)
     _flag = lambda chunk: FLAG_SECRET.sub(
         lambda m: m.group(0) if PLACEHOLDER in m.group(2)
+        # `--api-key <your-api-key-here>` is a usage line, not a credential. Same reasoning as
+        # `_names_a_mechanism`'s angle-placeholder branch; this rule has its own guard chain.
+        or _is_an_angle_placeholder(m.group(2))
         # The next FLAG is not this flag's value. `tool --password --verbose` means the password
         # was not given on the command line at all; redacting `--verbose` would be pure noise.
         # A lookahead in the pattern was tried first and let this through, so it is asserted here.
@@ -3039,6 +3133,11 @@ _CHAT_TEMPLATE_SENTINEL = re.compile(r"<\|([^\s<>|]+)\|>")
 _TERMINAL_SAFE = str.maketrans({
     **{chr(i): None for i in range(0x20) if chr(i) not in "\n\t"},
     chr(0x7F): None,
+    # 🐛 [2026-09-24] (R1 session 2026-09-24; Trail of Bits 2025-04 on ANSI escapes in tool
+    # output) C0 and DEL were here and C1 was not — U+0080..U+009F, where U+009B is a one-character
+    # CSI that some terminals honour exactly like ESC [. Measured: `for_a_terminal("b\x9b31mc")`
+    # came back with the control intact. The same set as the line above, one block further up.
+    **{chr(i): None for i in range(0x80, 0xA0)},
     **{chr(i): None for i in range(0x202A, 0x202F)},
     # 🐛 [2026-09-07] Extended from 0x206A to 0x2070, and the four before it added, after deriving
     # the full set: 66 format code points survived this table. Most of them stay, deliberately.

@@ -14,6 +14,7 @@ import time
 import contextlib
 import pathlib
 import os
+from datetime import datetime, timezone
 import sys
 from pathlib import Path
 
@@ -131,6 +132,9 @@ os.environ.setdefault("GIT_NO_LAZY_FETCH", "1")
 #
 # Appended to whatever the user already has rather than assigned, so an existing `GIT_CONFIG_COUNT`
 # keeps its entries and ours are added after it.
+_REFUSE_COMMAND = "chamnan-refuses-repository-supplied-command"
+
+
 def _harden_git_config():
     """Refuse the repository-controlled config keys that turn a read into an execution."""
     # 🐛 [2026-09-19] (self-measured) Five of these were `""`, and on Windows assigning an empty
@@ -151,7 +155,7 @@ def _harden_git_config():
     #
     # `diff.external` is the one with a caller: both `git diff` sites in this package now pass
     # `--no-ext-diff`, so the refusal is stated on the command line and never reaches this value.
-    _REFUSE = "chamnan-refuses-repository-supplied-command"
+    _REFUSE = _REFUSE_COMMAND
     forced = (
         ("core.fsmonitor", "false"),
         ("core.pager", "cat"),
@@ -183,6 +187,92 @@ def _harden_git_config():
 _FORCED_AT = {}
 
 _harden_git_config()
+
+
+# 🐛 [2026-09-24] (self-measured) The eleven keys above are FIXED names, and an attribute driver is
+# not: `.gitattributes` says `*.txt filter=anything`, and the program lives in config under
+# `filter.anything.clean` (or `.smudge`, `.process`), `diff.anything.textconv` (or `.command`),
+# `merge.anything.driver` — a name the repository chooses, so no list written here can reach it.
+# Measured on git 2.55: a `filter.<name>.clean` or `.process` set in a repository's own config ran
+# on `git status --porcelain`, `git diff --quiet` and `git diff` alike, whenever a file's stat info
+# had changed — which is every session in a repository somebody is working in. `textconv` ran only
+# for a patch, and every patch-producing call here already passes `--no-textconv`.
+#
+# So the names are read from the repository itself, once per repository, and each one found in a
+# REPOSITORY scope (`local`, `worktree`, or a file those include — git reports an included file under
+# the scope of the file that included it) gets the same environment override the fixed keys get.
+# `global` and `system` are left alone: those are the user's own choices — `git lfs install` writes
+# `filter.lfs.*` there — and overriding them would make every LFS file read as modified. The cost of
+# the override inside a repository scope is the same, and accepted: a git-crypt or `lfs install
+# --local` checkout may list a touched-but-unchanged file as modified, which is a wrong line in a
+# notice rather than a stranger's program running as the user.
+#
+# `required` is forced false beside every filter, because measured: a refused `process` with
+# `filter.<name>.required = true` makes `git status` exit 128, and every caller here reads a failed
+# status as "git cannot answer".
+#
+# The spawn is paid only when the repository's config could name a driver at all. SessionStart is
+# held to a process ceiling, and the plain-text test below is exact for the common layout: a `.git`
+# DIRECTORY whose `config` has no `[filter`, `[diff` or `[merge` section and no `include`, and no
+# `config.worktree`. Anything else — a `.git` file, `GIT_DIR` set, an unreadable config — asks git.
+_DRIVER_CONFIG = r"^(filter|diff|merge)\..+\.(clean|smudge|process|textconv|command|driver)$"
+_DRIVER_SECTION = re.compile(r"^\s*\[\s*(filter|diff|merge)\b|include", re.I | re.M)
+_TRUSTED_SCOPES = ("global", "system", "command")
+_DRIVERS_STOOD_DOWN = set()
+
+
+def _config_could_name_a_driver(toplevel):
+    """False only when a plain read proves the repository's config names no driver."""
+    if not toplevel or os.environ.get("GIT_DIR") or os.environ.get("GIT_COMMON_DIR"):
+        return True
+    git_dir = Path(toplevel) / ".git"
+    if not git_dir.is_dir() or (git_dir / "config.worktree").exists():
+        return True
+    try:
+        text = (git_dir / "config").read_text(encoding="utf-8", errors="replace")
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    return bool(_DRIVER_SECTION.search(text))
+
+
+def _stand_down_repository_drivers(root, toplevel):
+    """Override every attribute driver the repository's own config names. Once per repository."""
+    key = str(Path(toplevel or root).resolve())
+    if key in _DRIVERS_STOOD_DOWN:
+        return
+    _DRIVERS_STOOD_DOWN.add(key)
+    if not _config_could_name_a_driver(toplevel):
+        return
+    try:
+        out = _subprocess().run(
+            ["git", "-C", str(root), "config", "--show-scope", "-z", "--get-regexp", _DRIVER_CONFIG],
+            stdin=_subprocess().DEVNULL, capture_output=True, timeout=5)
+    except git_cannot_answer():
+        return
+    fields = out.stdout.split(b"\0")
+    forced = []
+    for scope, entry in zip(fields[0::2], fields[1::2]):
+        scope = scope.decode("utf-8", "replace")
+        name = entry.decode("utf-8", "replace").split("\n", 1)[0]
+        if scope in _TRUSTED_SCOPES or name.count(".") < 2:
+            continue
+        section, rest = name.split(".", 1)
+        driver, variable = rest.rsplit(".", 1)
+        forced.append((name, "cat" if variable in ("clean", "smudge", "textconv") else _REFUSE_COMMAND))
+        if section == "filter":
+            forced.append(("filter.%s.required" % driver, "false"))
+    if not forced:
+        return
+    try:
+        start = max(int(os.environ.get("GIT_CONFIG_COUNT", "0") or 0), 0)
+    except ValueError:
+        start = 0
+    for offset, (name, value) in enumerate(forced):
+        os.environ["GIT_CONFIG_KEY_%d" % (start + offset)] = name
+        os.environ["GIT_CONFIG_VALUE_%d" % (start + offset)] = value
+    os.environ["GIT_CONFIG_COUNT"] = str(start + len(forced))
 
 
 # 🐛 [2026-09-19] (self-measured), from the full gate run of this date. `core.hooksPath` is forced to `/dev/null` above so a repository's hooks cannot
@@ -262,6 +352,27 @@ DEFAULT_CONFIG = {
     # replaces. 3,000 tokens is well under 1% of a 1M context window and still holds a few hundred
     # files. chamnan-map reports against it and says what to cut when it is exceeded.
     "index_token_budget": 3000,
+    # 🎯 [owner 2026-09-23, direction H — Tier 3] Which test file covers which source file is
+    # answered two ways already: an import edge, and the naming conventions in `impact.py`. Both
+    # are evidence, neither is a rule, and a project whose tests are named some third way gets
+    # neither. One entry per unusual layout, `"<test glob>": "<source glob>"`, e.g.
+    # `{"spec/**/*_spec.rb": "app/**/*.rb"}`.
+    #
+    # Empty by default and it must stay that way: a default here would be this project's own
+    # conventions imposed on everybody else's repository, which is the opposite of reading what a
+    # repository already does. A key absent from DEFAULT_CONFIG is dropped by `load_config`, so
+    # the entry has to exist even though it holds nothing.
+    "test_patterns": {},
+    # 🐛 [2026-09-23] (self-measured) `chamnan-guard` shipped with a `--strict` mode documented as "for a
+    # hook somebody opted into", and there was no hook and no key to opt in WITH. It had run
+    # zero times in thirteen days against 294 recorded `git commit` calls. On by default
+    # because it only ever WARNS; the strict version is still opt-in by being a separate
+    # invocation somebody puts in their own pre-commit hook.
+    "commit_guard": True,
+    # The statistic pages rebuild at session end, in the background, reading only
+    # what was written since the last build. Off means the pages keep whatever
+    # figures they last had rather than going stale silently.
+    "dashboard": True,
     # A hard ceiling in BYTES on everything the SessionStart hook prints, enforced after the token
     # budgets above have already had their say. The two are not the same measurement and cannot
     # substitute for each other: the host truncates a hook's stdout over 10,000 bytes to its first
@@ -648,6 +759,45 @@ def enabled(part, root=None):
 # The reason it was missed is worth keeping: `blocklog` declares its path as `"logs/block_shape.jsonl"`
 # — WITH the directory — so a search for a bare `"*.jsonl"` filename literal walks straight past it.
 # `44_...` in the check pool now asserts the population instead of trusting this list to be complete.
+# Keys kept short because they land on a hot-path log: `edits.jsonl` gets one line per Write and
+# Edit, for years. `ag` is the run, `ty` is the kind.
+ACTOR_KEYS = ("ag", "ty")
+
+
+def actor(payload):
+    """`{"ag": agent_id, "ty": agent_type}` for a tool call made by a subagent, `{}` otherwise.
+
+    🎯 [2026-09-23] The backlog recorded "the hook cannot see which agent made an edit" as the wall
+    a whole direction stood behind. It is not one. The hooks reference, under *Hooks in subagents*:
+    *"When a subagent calls a tool, tool events such as `PreToolUse` and `PostToolUse` fire the same
+    configured hooks as in the main conversation, and the input carries the `agent_id` and
+    `agent_type` common input fields that identify the subagent."* The fields have been arriving all
+    along and no writer read them.
+
+    **Absent, not empty, on the main thread.** A record with no `ag` means the session itself made
+    the change; a record with `ag: ""` would mean an agent whose id could not be read, and a reader
+    that cannot tell those apart will count the common case as the rare one. It also keeps the
+    ordinary line the size it is today — this log already reaches 20,000 records.
+
+    One helper rather than three call sites reading the payload themselves, because a field added at
+    one writer and forgotten at the identical ones beside it is this repository's most-recorded
+    defect. The suite derives the population from source and asserts every per-tool-call writer
+    passes through here.
+    """
+    if not isinstance(payload, dict):
+        return {}
+    out = {}
+    ident = payload.get("agent_id")
+    kind = payload.get("agent_type")
+    # Truncated at the writer rather than the reader: an id or a name is short, and a payload that
+    # carries something long carries it into every line of a log that is never rewritten.
+    if isinstance(ident, str) and ident.strip():
+        out["ag"] = ident.strip()[:64]
+    if isinstance(kind, str) and kind.strip():
+        out["ty"] = kind.strip()[:60]
+    return out
+
+
 def append_jsonl(root, rel, row, keep):
     """Append one record to a workspace `.jsonl` and trim it to the newest `keep`. Never raises.
 
@@ -692,11 +842,29 @@ def append_jsonl(root, rel, row, keep):
 
 SELF_PRUNING_LOGS = ("commands.jsonl", "pointer.jsonl", "scratch.jsonl", "edits.jsonl",
                     "subagent_start.jsonl", "block_shape.jsonl", "gate_runs.jsonl",
+                    "failures.jsonl",
                     # One row per subagent run, bounded by record like the rest: what it cost and
                     # whether it ran on the model its own file declares. A cost history is worth
                     # having only if it is long enough to compare against, which an age sweep would
                     # make it not.
                     "agent_results.jsonl",
+                    # 🐛 [2026-09-23] `recovered.jsonl` was already bounded by record at its one
+                    # call site — `append_jsonl(root, QUARANTINE_LOG, …, 500)` — and was simply never
+                    # declared here, so the check that every jsonl is self-pruning or disposable
+                    # counted it as neither. It belongs on this side rather than among the
+                    # disposable ones: each row records a store that could not be read and was
+                    # moved aside, which is a note about the reader's own data going wrong. Five
+                    # hundred of those is a small file and an age sweep deleting it would answer
+                    # "that never happened" to the one question it exists to answer.
+                    "recovered.jsonl",
+                    # 🐛 [2026-09-24] (self-measured) The identical case to `recovered.jsonl` one
+                    # line above, and missed the same way: `commit_guard.jsonl` is capped at 500
+                    # records at its own call site — `append_jsonl(root, …, 500)` — and was simply
+                    # never declared here, so the check counted it as neither self-pruning nor
+                    # disposable. The comment above records that exact oversight being fixed for
+                    # one file; this is the next one along, which is this repository's own
+                    # commonest defect happening inside the note describing it.
+                    "commit_guard.jsonl",
                     # 🐛 [2026-09-10] `state-ages.json` records WHEN each STATE.md section last
                     # changed, which is the whole input to `state.age_out`. It lived in `logs/`
                     # and was not exempt, so the 7-day file sweep deleted it — while
@@ -953,6 +1121,92 @@ def _own_process_started():
     return _OWN_PROCESS_STARTED[0]
 
 
+# 🎯 [owner, 2026-09-23] "chamnan ก็ควรมีระบบเคลียร์ได้เองนะ เพราะ repo คนใช้งานคนอื่น มันก็ควรมี
+# ระบบเคลียร์ให้ แต่จะวางระบบยังไงให้ปลอดภัยกับคนใช้ทั่วไป" — and the scope they set: "เราไม่แตะพื้นที่นอก repo
+# chamnan เคลียแค่ log ใน repo กับ stage ทันปิด แต่ลืมลบ".
+#
+# `prune_orphaned_temps` covers a killed atomic WRITE, which leaves a `.tmp` file. It does not
+# cover the other half: a tool that made itself a working DIRECTORY inside the workspace and
+# finished without removing it. That is not hypothetical — `corpus_coverage.py` cleaned its copy
+# at the start of the NEXT run rather than the end of this one, so the workspace permanently
+# carried 795 files and 8.8 MB of somebody else's repository, and it confused two other tools
+# before anybody noticed it was there.
+#
+# 🔴 The safety property, which is the whole design: **only a directory chamnan created and
+# MARKED is ever removed.** An unmarked directory under `logs/` is something the user put there
+# and is never touched, at any age. That inverts the usual retention question from "can I prove
+# this is safe to delete" — which nothing in a stranger's repository can answer — to "did I make
+# this myself", which is a fact written down at creation time.
+SCRATCH_MARK = ".chamnan-scratch"
+
+
+def scratch_dir(root, name):
+    """A working directory under `logs/`, marked as ours so the sweep may remove it later.
+
+    The marker is written FIRST. A run killed between mkdir and mark leaves an unmarked directory,
+    which this sweep will then refuse to touch for ever — the safe direction, and the reason the
+    order is not the other way round.
+    """
+    base = workspace(root)
+    if base is None:
+        return None
+    d = base / "logs" / name
+    d.mkdir(parents=True, exist_ok=True)
+    try:
+        # 🐛 [2026-09-24] (self-measured) The last hand-rolled `write_text` in shipped code, and
+        # the sweep asserts the SET rather than a list of names, which is how it stayed visible
+        # after every other site was converted. A plain write truncates on open: a reader arriving
+        # mid-write gets a short file and a crash leaves one behind. The content is forty-odd
+        # fixed bytes, so nothing was ever likely to go wrong here — and "unlikely" is the reason
+        # a site gets left out of a sweep and then outlives the reason it was safe.
+        atomic_write_text(d / SCRATCH_MARK, "chamnan scratch; safe to delete when quiet\n")
+    except OSError:
+        return None
+    return d
+
+
+def prune_scratch(root=None, max_age=None):
+    """Remove MARKED scratch directories whose every file has gone quiet. Silent, best effort."""
+    import time
+    ws_dir = workspace(root)
+    if ws_dir is None or not ws_dir.is_dir():
+        return 0
+    logs = ws_dir / "logs"
+    if not logs.is_dir():
+        return 0
+    # The same window `prune_logs` uses, read from the same place, so a reader who changes
+    # `log_retention_days` does not find one of the two sweeps still on an old number.
+    days = load_config(root).get("log_retention_days", 7)
+    cutoff = time.time() - (max_age if max_age is not None else days * 86400)
+    removed = 0
+    try:
+        entries = list(logs.iterdir())
+    except OSError:
+        return 0
+    for path in entries:
+        try:
+            # A symlink is never followed and never removed as a tree: the one incident that
+            # taught this module anything was a link to `/` under logs/.
+            if not path.is_dir() or path.is_symlink():
+                continue
+            if not (path / SCRATCH_MARK).is_file():
+                continue                      # not ours — not our business, at any age
+            fresh = False
+            for f in path.rglob("*"):
+                if not f.is_file() or f.name == SCRATCH_MARK:
+                    continue
+                mt = _mtime_or_none(f)
+                if mt is not None and mt >= cutoff:
+                    fresh = True
+                    break
+            if not fresh:
+                _rmtree_quietly(path)
+                removed += 1
+        except OSError:
+            continue
+    return removed
+
+
 def prune_orphaned_temps(root=None):
     """Remove staging files a killed write left behind. Best effort and silent, like every prune.
 
@@ -1143,6 +1397,21 @@ def _rmtree_quietly(path):
         pass
 
 
+def expiring_sessions(root=None, within_days=1.0):
+    """Session records `prune_sessions` will delete within a day, newest first.
+
+    The sibling of `expiring_logs`, and added because it was missing. That one exists because a
+    dated `.md` note somebody typed was being deleted in silence; a session record is the same
+    kind of file with a stronger claim -- `sessions.prune` calls it "committed work rather than
+    cache" in its own comment -- and had no warning at all. One number, one window, one place the
+    rule lives: `sessions.expiring` asks what the delete will actually do rather than re-deriving
+    it beside it.
+    """
+    import sessions
+    return sessions.expiring(root, load_config(root).get("session_retention_days", 30),
+                             within_days)
+
+
 def prune_sessions(root=None):
     """Apply session_retention_days to sessions/. Called alongside prune_logs from the same
     bin/ commands; separate because the two windows differ and conflating them would mean one
@@ -1240,8 +1509,48 @@ def _is_inside(inner, outer):
 JSON_READ_CEILING = 4_000_000    # bytes
 
 
-def load_json(path, want=dict):
+QUARANTINE_LOG = "logs/recovered.jsonl"
+
+
+def _quarantine(path, why):
+    """Move a store that cannot be read aside, and say so. Returns where it went, or ""..
+
+    🎯 [1.31, a second reader's #5] Atomic writes and the lock are solid; what was missing is what
+    happens when a store is ALREADY corrupt. The answer everywhere was to return an empty one and
+    carry on — and for `state-ages.json` that means nothing can ever become old enough to age out
+    again, silently, forever. The owner's own retention note names it and `nudge_state.json` as the
+    two files whose deletion costs something a rebuild cannot give back.
+
+    So: verify, quarantine, and leave a record. Never a silent reset, and never a delete — the
+    corrupt file is the only copy of whatever was in it, and a person may be able to read what a
+    parser could not.
+    """
+    try:
+        path = pathlib.Path(path)
+        if not path.is_file():
+            return ""
+        dest = path.with_name(path.name + ".corrupt."
+                              + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S"))
+        os.replace(path, dest)
+    except OSError:
+        return ""
+    try:
+        root = find_root(path)
+        if root is not None:
+            append_jsonl(root, QUARANTINE_LOG,
+                         {"at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                          "file": path.name, "why": str(why)[:120], "kept_as": dest.name}, 500)
+    except Exception:              # noqa: BLE001 — recording a recovery must not break one
+        pass
+    return str(dest)
+
+
+def load_json(path, want=dict, quarantine=False):
     """A JSON store read back, or an empty one of the right type. Never raises, never wrong-typed.
+
+    `quarantine=True` is for a store whose contents cannot be rebuilt: an unreadable file is moved
+    aside and recorded rather than silently replaced with an empty one. It is off by default
+    because most callers read something regenerable, where a quiet empty store IS the right answer.
 
     Every JSON loader in this package guarded `json.JSONDecodeError` and stopped there, which
     catches a file that is not JSON and misses a file that is *valid JSON of the wrong shape*. A
@@ -1259,9 +1568,17 @@ def load_json(path, want=dict):
         # below, which returns the empty store, the same degraded answer as a missing file.
         with pathlib.Path(path).open(encoding="utf-8-sig") as fh:
             data = json.loads(fh.read(JSON_READ_CEILING))
-    except (OSError, json.JSONDecodeError, ValueError, RecursionError, UnicodeDecodeError):
+    except (OSError, json.JSONDecodeError, ValueError, RecursionError, UnicodeDecodeError) as exc:
+        if quarantine and not isinstance(exc, FileNotFoundError):
+            # A MISSING file is not a corrupt one: it is the ordinary first run, and quarantining
+            # nothing would write a recovery record for every empty workspace.
+            _quarantine(path, exc.__class__.__name__)
         return want()
-    return data if isinstance(data, want) else want()
+    if not isinstance(data, want):
+        if quarantine:
+            _quarantine(path, f"valid JSON of the wrong shape: {type(data).__name__}")
+        return want()
+    return data
 
 
 class NotAWorkspace(Exception):
@@ -1717,6 +2034,12 @@ def _as_tuple(version):
     return tuple(out[:3]) + (pre,)
 
 
+# What `reconcile_version` returns when `.version` held something that is not a version at all. A
+# name rather than a literal at both ends, because the caller must tell it apart from a real
+# version string: the two mean different things and call for different sentences.
+UNREADABLE_VERSION = "an unreadable version"
+
+
 def reconcile_version(root, running):
     """Record the newest version that has touched this workspace; report a DOWNGRADE.
 
@@ -1768,7 +2091,7 @@ def reconcile_version(root, running):
         # instead of every session forever. What is given up is knowing which version was recorded,
         # and that was already unknowable: the string could not be parsed.
         atomic_write_text(path, running + "\n")
-        return "an unreadable version"
+        return UNREADABLE_VERSION
     if seen and _as_tuple(running) < _as_tuple(seen):
         return seen
     # \U0001f41b [2026-09-10] Both writes above and here were `Path.write_text`, which TRUNCATES on
@@ -2090,7 +2413,53 @@ IGNORE_LINES = [
     "# before the two research stores were split into per-section entries) and changes every time",
     "# any of them does, so committing it would put the whole corpus in the diff twice.",
     "state/store_index.json",
+    "",
+    # 🐛 [2026-09-24] (self-measured) Found by running chamnan against chamnan-corpus as an
+    # ordinary user would.
+    # The two rules above reason correctly -- a file that is a FUNCTION of the commit does not
+    # belong in the diff -- and then stop, one file short of the identical cases beside them. This
+    # package encourages committing the workspace, so every session start in a shared repository
+    # was producing a diff in files nobody edits by hand, and `notices.json` was worse than noise:
+    # it counts how many times a one-off piece of advice has been shown to THIS person, so sharing
+    # it means the first teammate to see a notice silences it for everybody.
+    #
+    # `drift.json` is `{\"head\": \"<sha>\", \"notice\": \"\"}` -- literally a function of HEAD, the
+    # same argument as churn-*.json one paragraph up. `.temps-swept` is a housekeeping timestamp
+    # for THIS machine's last sweep.
+    #
+    # Enumerating was the bug, so the set is declared below and a check derives the population from
+    # the source: a new `state/` writer that is in neither list fails it.
+    "state/drift.json",
+    "state/.temps-swept",
+    "state/notices.json",
+    "state/statistic_scan_cache.json",
+    "",
+    "# chamnan: the dashboard. `statistic/data/` and the pages beside it are built at session end",
+    "# from THIS person's logs and transcripts — their working hours and the files they touched.",
+    "# Rebuilt in about a second, and never something to put in a teammate's checkout.",
+    "statistic/",
 ]
+
+# Every path chamnan itself writes under `state/`, classified, because the list above was built by
+# enumeration three times and missed a sibling each time. DERIVED is a function of something else
+# and is rebuilt on demand; RECORDED is memory a team is meant to share, and committing it is the
+# entire reason the workspace lives beside the code. A `state/` write in the source that appears in
+# neither is a file nobody has decided about, which is how the three above were missed.
+DERIVED_STATE = (
+    "state/churn-*.json",           # a function of the commit
+    "state/store_index.json",       # rebuilt from the stores in ~30 ms
+    "state/drift.json",             # a function of HEAD
+    "state/.temps-swept",           # this machine's last sweep
+    "state/notices.json",           # how often THIS person has been shown a one-off notice
+    "state/statistic_scan_cache.json",  # per-transcript scan cache the dashboard build keeps
+)
+RECORDED_STATE = (
+    "state/written_artefacts.json", # what was written, and by which run
+    "state/scheduled.json",         # the schedule the team agreed
+    "state/gotcha_marks.json",      # lessons marked against a path
+    "state/tool_usage.json",        # which stores this workspace actually opens; fit.shrink ranks on it
+    "state/agent_model_mismatches.jsonl",
+)
 
 
 # Rules appended to .chamnan/.gitignore by the last `_mark_ignored` that changed it, so a caller can
@@ -3418,8 +3787,13 @@ def git_can_speak_for(root):
             global _GIT_TOO_OLD
             _GIT_TOO_OLD = True
         answer = out.returncode == 0 and bool(out.stdout.strip())
+        toplevel = out.stdout.strip() if answer else None
         if not answer:
             answer = git_owns(root)          # a bare repository, which has no working tree
+        # Every `git -C` in the package asks this first, so this is the one place that sees each
+        # repository before git reads its config. See `_stand_down_repository_drivers`.
+        if answer:
+            _stand_down_repository_drivers(root, toplevel)
     _GIT_SPEAKS[key] = answer
     return answer
 

@@ -384,7 +384,7 @@ def mark_pointed(wsdir, session_id, rel_path):
         pass
 
 
-def note(wsdir, session_id, rel_path, hits, ms):
+def note(wsdir, session_id, rel_path, hits, ms, actor=None, why=""):
     """Record that a pointer fired, and what it named.
 
     This is the measurement the last review round asked for and it is deliberately NOT
@@ -396,6 +396,21 @@ def note(wsdir, session_id, rel_path, hits, ms):
     """
     rec = {"t": int(time.time()), "session": session_id, "path": rel_path,
            "named": [h[1] for h in hits], "ms": round(ms, 1)}
+    # 🎯 [1.31 queue item 3, a second reader 2026-09-23] "`source_opened` ไม่ได้แปลว่า brief
+    # ไม่ดี บางงาน agent ควรเปิดไฟล์อยู่แล้วเพราะกำลังจะแก้มัน" — without a reason beside it, an open is
+    # an undifferentiated event and a utility-per-byte allocator would learn from a mixed signal.
+    #
+    # 🔴 The reason is not inferred and not guessed: it is the TOOL the host used, which states
+    # the intent outright. `Read` is a look, and a look at something the index could have answered
+    # is the case worth counting. `Edit`, `Write` and `NotebookEdit` are a declared intent to
+    # change the file, and opening a file you are about to edit is correct behaviour that must
+    # never be scored as a pointer failing.
+    if why:
+        rec["why"] = why[:24]
+    # Which AGENT was pointed at something, not only which session — a session that dispatches ten
+    # subagents looks like one reader in this log without it, which is the shape M page 2 asks
+    # about. Absent on the main thread, like every other actor field.
+    rec.update(actor or {})
     # 🐛 [2026-09-10] The bound added the day before was a `_trim()` here that did an
     # unlocked read-modify-write on `EVENT_LOG` — and `EVENT_LOG` is ONE path that every session on
     # the machine writes, carrying `session` as a FIELD rather than as a filename. A record appended
@@ -469,7 +484,7 @@ def opens_by_store(root):
     return out
 
 
-def note_opened(wsdir, session_id, rel_path):
+def note_opened(wsdir, session_id, rel_path, actor=None):
     """Record that a session opened one of chamnan's own STORE files directly.
 
     Called from the hook's early return for a path under the workspace itself -- exactly where
@@ -485,10 +500,11 @@ def note_opened(wsdir, session_id, rel_path):
     an empty `named` list -- three existing records already carry one for unrelated reasons.
     """
     rec = {"t": int(time.time()), "session": session_id, "path": rel_path, "event": "opened"}
+    rec.update(actor or {})
     ws.append_jsonl(Path(wsdir).parent, EVENT_LOG, rec, KEEP)
 
 
-def note_query(wsdir, session_id, rel_path, pattern=""):
+def note_query(wsdir, session_id, rel_path, pattern="", actor=None):
     """Record that a session SEARCHED one of chamnan's own files, rather than opening it.
 
     🎯 [R3.11.5, 2026-09-16] `note_opened` can only see a Read, and the two artefacts this plugin
@@ -509,6 +525,7 @@ def note_query(wsdir, session_id, rel_path, pattern=""):
     rec = {"t": int(time.time()), "session": session_id, "path": rel_path, "event": "query"}
     if pattern:
         rec["q"] = pattern[:80]
+    rec.update(actor or {})
     ws.append_jsonl(Path(wsdir).parent, EVENT_LOG, rec, KEEP)
 
 
