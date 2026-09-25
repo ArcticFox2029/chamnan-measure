@@ -45,7 +45,7 @@ CARRIED = ("Remaining", "Blockers")
 # script" — and this cap was the member of that set nobody revisited. Measured with chamnan's own
 # estimator: a Thai carry-forward note costs 1.99x the tokens of an English one at the same
 # character count, so a repository working in Thai was silently spending twice the injection budget
-# this number was chosen to bound (R10 acc3, 2026-09-07). 500 is what 1,200 characters of English came to, so
+# this number was chosen to bound (R10, 2026-09-07). 500 is what 1,200 characters of English came to, so
 # the English case is unchanged and only the mis-priced one moves.
 MAX_CARRY_TOKENS = 500
 
@@ -229,7 +229,7 @@ def where_git_says_you_stopped(root, limit=6, name_files=True, status=None):
         # interrupted `git init`, a copied-without-contents `.git` -- made every call below walk up
         # and answer about the nearest REAL repository above it. Reproduced: this section reported
         # "10 uncommitted file(s)" and named a branch, for a directory containing one file and no
-        # commits at all; both numbers were the ancestor's (R6 acc3, 2026-09-06, first ten minutes).
+        # commits at all; both numbers were the ancestor's (R6, 2026-09-06, first ten minutes).
         return ""
     try:
         # 🐛 [2026-09-06] chamnan's OWN workspace was counted as the user's uncommitted work. git
@@ -267,7 +267,12 @@ def where_git_says_you_stopped(root, limit=6, name_files=True, status=None):
             return ""
         lines = [(code, name) for code, name in status
                  if code != "!!" and name != _ws_rel and not name.startswith(_ws_rel + "/")]
-        if not lines:
+        # 🐛 [2026-09-25] (R118, 2026-09-25) Two branches that each rebuilt the map always conflict in
+        # it -- measured: every merge of two such branches stopped on `.chamnan/MAP.md` -- and the
+        # map is generated, so the way out is to rebuild it, which nothing said. The workspace is
+        # filtered out of the list above, so the conflict is looked for here, before it is gone.
+        map_conflict = any(code in _UNMERGED and name == _ws_rel + "/MAP.md" for code, name in status)
+        if not lines and not map_conflict:
             return ""          # a clean tree has nothing to carry forward, which is the good case
         br = subprocess.run(["git", "-C", str(root), "rev-parse", "--abbrev-ref", "HEAD"],
                             stdin=subprocess.DEVNULL, capture_output=True, text=True, encoding="utf-8", errors="replace",
@@ -294,7 +299,7 @@ def where_git_says_you_stopped(root, limit=6, name_files=True, status=None):
     # 🐛 [2026-09-06] A session resumed in the middle of a rebase or a conflicted merge was told it
     # had an ordinary dirty tree -- a file count and a branch name -- and the one fact that changes
     # what the reader should do next was dropped: you are stuck, and the way out is `--continue` or
-    # `--abort` (R6 acc3, 2026-09-06, unusual repositories). git records the state in its own directory rather
+    # `--abort` (R6, 2026-09-06, unusual repositories). git records the state in its own directory rather
     # than in `status --porcelain`'s first two columns, so it has to be asked separately. Read from
     # disk, not from another `git` call: this is a section that already costs three subprocesses.
     interrupted = _interrupted_by(root)
@@ -318,6 +323,11 @@ def where_git_says_you_stopped(root, limit=6, name_files=True, status=None):
         lead = (f"**This repository is in the middle of {interrupted[0]}**{where} — that is why the "
                 f"tree looks like this. Finish it with `{interrupted[1]}` or undo it with "
                 f"`{interrupted[2]}` before treating anything below as work in progress:\n")
+    if map_conflict:
+        lead += (f"`{_ws_rel}/MAP.md` is in conflict. It is generated, so do not merge it by hand: "
+                 f"`chamnan-map` rebuilds it from the merged tree, then `git add {_ws_rel}/MAP.md`.\n")
+    if not lines:
+        return lead
     if not name_files:
         # 🐛 Claude Code injects its own `gitStatus` block once per session, and on a dirty tree it
         # already lists every changed file with no truncation, before any hook runs. Measured on
@@ -336,6 +346,10 @@ def where_git_says_you_stopped(root, limit=6, name_files=True, status=None):
 # common one; the cap exists so a busy shared day cannot push the whole injected block over its
 # budget, and it is small because MAX_CARRY_TOKENS is shared across all of them.
 MAX_CARRIED_RECORDS = 3
+
+
+# The two-letter codes `status --porcelain` gives a path that still has conflicts.
+_UNMERGED = {"DD", "AU", "UD", "UA", "DU", "AA", "UU"}
 
 
 def _outstanding(path, refuse_conflicts=False):

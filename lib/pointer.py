@@ -226,7 +226,7 @@ def related(wsdir, rel_path, max_hits=MAX_HITS):
                 text = f.read_text(encoding="utf-8-sig", errors="replace")
             except OSError:
                 continue
-            # 🐛 [2026-09-24] (R21 acc5, 2026-09-24) A thread marked closed was still named every time a file it
+            # 🐛 [2026-09-24] (R21, 2026-09-24) A thread marked closed was still named every time a file it
             # lists was opened: on Lumin-App the most-named entry in 24 days, 56 times, was a thread
             # closed since the 1.6.0 batch, and in 35 of those it was the ONLY thing named — so the
             # pointer's whole message was "read this finished work". Found by testing a research
@@ -406,8 +406,8 @@ def note(wsdir, session_id, rel_path, hits, ms, actor=None, why=""):
     """
     rec = {"t": int(time.time()), "session": session_id, "path": rel_path,
            "named": [h[1] for h in hits], "ms": round(ms, 1)}
-    # 🎯 [1.31 queue item 3, a second reader 2026-09-23] "`source_opened` ไม่ได้แปลว่า brief
-    # ไม่ดี บางงาน agent ควรเปิดไฟล์อยู่แล้วเพราะกำลังจะแก้มัน" — without a reason beside it, an open is
+    # 🎯 [1.31 queue item 3, a second reader 2026-09-23] An open does not mean the brief was bad: some
+    # work has to open the file because it is about to change it. Without a reason beside it, an open is
     # an undifferentiated event and a utility-per-byte allocator would learn from a mixed signal.
     #
     # 🔴 The reason is not inferred and not guessed: it is the TOOL the host used, which states

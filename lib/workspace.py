@@ -14,9 +14,110 @@ import time
 import contextlib
 import pathlib
 import os
+import errno
 from datetime import datetime, timezone
 import sys
 from pathlib import Path
+
+# The environment exactly as the person's process had it, before this module changes anything below
+# for its OWN git reads (the lock waiver, lazy fetch, and the eleven repository-settable programs it
+# refuses). Those are safeguards for chamnan reading a repository. They are not the person's
+# settings, and a program chamnan starts ON THEIR BEHALF must not inherit them -- see
+# `env_for_the_persons_command`.
+_PERSONS_ENV = dict(os.environ)
+
+
+# 🐛 [2026-09-25] (R98, 2026-09-25) `chamnan-where check | head -1` ended with `BrokenPipeError` on stderr
+# and exit 120: the reader closed the pipe, the next write raised, and the flush at shutdown raised
+# again. Every command in `bin/` imports this module, so the handling lives here once rather than in
+# twenty mains. It is the pattern the Python documentation gives (signal module, "Note on SIGPIPE"):
+# point stdout at devnull so the shutdown flush has somewhere to go, and leave with status 1. Every
+# other exception goes to whatever hook was installed before, unchanged. SIGPIPE is not set to
+# SIG_DFL, which the same documentation warns against.
+def _stdout_is_gone():
+    """Whether stdout's reader has gone, asked of stdout itself rather than of an exception's type.
+
+    🐛 [2026-09-25] (self-measured, CI) On Windows under Python 3.8 a write into a closed pipe raises
+    `OSError: [Errno 22] Invalid argument`, not `BrokenPipeError`, so a check on the type alone
+    missed it there and the command still exited 120. A flush that fails is the one answer that
+    holds on every platform.
+    """
+    try:
+        sys.stdout.flush()
+    except (OSError, ValueError):
+        return True
+    except AttributeError:
+        return False
+    return False
+
+
+def _to_devnull():
+    try:
+        os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+    except (OSError, ValueError, AttributeError):
+        pass
+
+
+def _quiet_broken_pipe(kind, value, tb, _previous=sys.excepthook):
+    if isinstance(kind, type) and (issubclass(kind, BrokenPipeError)
+                                   or (issubclass(kind, OSError)
+                                       and getattr(value, "errno", None) == errno.EINVAL
+                                       and _stdout_is_gone())):
+        _to_devnull()
+        return
+    _previous(kind, value, tb)
+
+
+def _flush_or_let_go():
+    """At exit, flush stdout; if the reader has gone, point stdout at devnull instead.
+
+    The case above is an exception nobody caught. The commoner one is none at all: the writes land
+    in the stream's buffer, and only the interpreter's own final flush meets the closed pipe, after
+    every handler has run -- "Exception ignored while flushing sys.stdout" and exit 120. atexit
+    runs before that flush, so the flush happens here, where it can be answered. The command's own
+    exit status is left as it was: the reader stopping early is not the command failing.
+    """
+    if _stdout_is_gone():
+        _to_devnull()
+
+
+# 🐛 [2026-09-25] (R108, 2026-09-25) Hooks run `git status` while the person, an editor or another
+# session may be running git in the same repository. A read-only status still takes `index.lock`
+# for a moment to write refreshed stat data back, and anyone else's `git add` in that moment fails
+# with "index.lock: File exists". Measured with a status loop beside 150 `git add`s: 68 failed with
+# the optional lock, 0 without it, and status took the same time either way. Every chamnan command
+# and hook imports this module, and every git it starts inherits this. Only the OPTIONAL lock is
+# waived; a command that writes still takes the lock it needs. A value the person set is kept.
+def env_for_the_persons_command(env=None):
+    """`env` (default: this process's) with every variable this module changed put back as it was.
+
+    🐛 [2026-09-25] (self-measured) `chamnan-schedule` started the person's own command -- by default a
+    resumed Claude session -- with `dict(os.environ)`, and that carried every safeguard this module
+    sets for its own reads: `credential.helper` and `core.sshCommand` refused, `core.hooksPath` at
+    /dev/null, `gpg.program` set to `true`, 24 GIT_* variables in all. A resumed session that ran
+    `git push` could not authenticate, the repository's hooks did not run, and signing failed.
+    Variables the caller adds afterwards (the account to resume on) are the caller's to add.
+    """
+    out = dict(os.environ if env is None else env)
+    for key in set(out) | set(_PERSONS_ENV):
+        was = _PERSONS_ENV.get(key)
+        if out.get(key) == os.environ.get(key) and out.get(key) != was:
+            if was is None:
+                out.pop(key, None)
+            else:
+                out[key] = was
+    return out
+
+
+OPTIONAL_LOCKS_WAIVED = "GIT_OPTIONAL_LOCKS" not in os.environ
+if OPTIONAL_LOCKS_WAIVED:
+    os.environ["GIT_OPTIONAL_LOCKS"] = "0"
+
+
+if getattr(sys.excepthook, "__name__", "") != "_quiet_broken_pipe":
+    sys.excepthook = _quiet_broken_pipe
+    import atexit as _atexit
+    _atexit.register(_flush_or_let_go)
 
 # \U0001f41b [2026-09-15] R6.7. On Windows, CreateProcess searches the CURRENT DIRECTORY before PATH,
 # and the current directory is the repository the user just opened. This package runs
@@ -668,7 +769,7 @@ def _in_range(key, value):
     return True
 
 
-# 🐛 [2026-09-24] (R45 acc4, 2026-09-24) Phrasing for the session-block notice about a KNOWN key
+# 🐛 [2026-09-24] (R45, 2026-09-24) Phrasing for the session-block notice about a KNOWN key
 # whose value `_merged` (below) is keeping on disk but the running config still ignores — named in
 # the reader's words rather than Python's, the same choice `_config_problem` already makes for
 # "array" over "list".
@@ -1137,10 +1238,8 @@ def _own_process_started():
     return _OWN_PROCESS_STARTED[0]
 
 
-# 🎯 [owner, 2026-09-23] "chamnan ก็ควรมีระบบเคลียร์ได้เองนะ เพราะ repo คนใช้งานคนอื่น มันก็ควรมี
-# ระบบเคลียร์ให้ แต่จะวางระบบยังไงให้ปลอดภัยกับคนใช้ทั่วไป" — and the scope they set: "เราไม่แตะพื้นที่นอก repo
-# chamnan เคลียแค่ log ใน repo กับ stage ทันปิด แต่ลืมลบ".
-#
+# 🎯 [owner, 2026-09-23] A plugin other people install has to clean up after itself, safely, and the
+# scope is the repository: its own logs, and working stages that finished but were never removed.
 # `prune_orphaned_temps` covers a killed atomic WRITE, which leaves a `.tmp` file. It does not
 # cover the other half: a tool that made itself a working DIRECTORY inside the workspace and
 # finished without removing it. That is not hypothetical — `corpus_coverage.py` cleaned its copy
@@ -1436,6 +1535,28 @@ def prune_sessions(root=None):
     return sessions.prune(root, load_config(root).get("session_retention_days", 30))
 
 
+def read_hook_payload(stream=None):
+    """The JSON event a host hands a hook on stdin -- or `{}`, said out loud, when a person ran the hook.
+
+    🐛 [2026-09-25] (R74, 2026-09-25) Every hook began with `json.load(sys.stdin)`. The host always pipes an
+    event in, but a person trying a hook in a terminal gets a TTY, and the load waits for input that
+    never comes: the hook looks hung. It happened in this project's own sessions more than once. A
+    TTY now means "no event": one line on stderr says what the hook expects, and the hook carries on
+    with an empty payload, which every hook already treats as nothing to do.
+    """
+    import json as _json
+    stream = sys.stdin if stream is None else stream
+    try:
+        interactive = stream.isatty()
+    except (AttributeError, ValueError, OSError):
+        interactive = False
+    if interactive:
+        print("chamnan: this is a hook -- it reads one JSON event on stdin from the host. "
+              "To try it by hand: echo '{\"cwd\": \".\"}' | python3 <hook>", file=sys.stderr)
+        return {}
+    return _json.load(stream)
+
+
 def hook_root(payload=None):
     """The repository root, for a hook, in the order the host actually guarantees.
 
@@ -1712,7 +1833,7 @@ def refuse_to_write(stream=None):
 # a downgrade can be reported with what it would otherwise have destroyed.
 LAST_CONFIG_KEYS_KEPT = []
 
-# 🐛 [2026-09-24] (R45 acc4, 2026-09-24) Known keys `ensure()` kept on disk exactly as written
+# 🐛 [2026-09-24] (R45, 2026-09-24) Known keys `ensure()` kept on disk exactly as written
 # because the value has the wrong type or is out of range — `load_config` already ignores each of
 # these at read time, same as `LAST_CONFIG_KEYS_KEPT` above is read by the session-start hook, so
 # the reader learns which of their settings are silently doing nothing instead of finding out from
@@ -1844,7 +1965,7 @@ def ensure(root=None):
                 if k in DEFAULT_CONFIG and isinstance(v, type(DEFAULT_CONFIG[k]))
                 and _in_range(k, v)}
         merged.update(good)
-        # 🐛 [2026-09-24] (R45 acc4, 2026-09-24) A known key that failed the check above used to be
+        # 🐛 [2026-09-24] (R45, 2026-09-24) A known key that failed the check above used to be
         # silently REPLACED here by the default, and the write below then put that default ON DISK
         # in place of what the user wrote — `{"log_retention_days": "30"}` became 7, not just in the
         # running config but in the file itself, and `log_retention_days` 90 -> 7 starts deleting
@@ -2790,6 +2911,17 @@ def atomic_write_text(dest, text, encoding="utf-8"):
         # own line endings; nothing here wants the platform's opinion.
         with tmp.open("w", encoding=encoding, newline="") as fh:
             fh.write(text)
+            # 🎯 [2026-09-25] (R8, 2026-09-25) A rename is atomic against a dying PROCESS, not against
+            # a power cut: without this the new name can survive a crash while the data behind it
+            # has not been written, and the file comes back empty. The directory is not synced as
+            # well -- that only decides whether the old file or the new one is found afterwards,
+            # both of which are whole, and Windows cannot open a directory to sync it. Measured on
+            # this machine: 2.06 ms -> 2.27 ms median per small write.
+            fh.flush()
+            try:
+                os.fsync(fh.fileno())
+            except OSError:
+                pass            # a filesystem that cannot sync still gets the atomic rename
         # 🐛 A rename REPLACES the file, so the destination's permissions go with it — and three of
         # the callers here write executable scripts, chmod them, then rewrite them to add a
         # shebang. Routing those through this function silently un-executabled every promoted tool
@@ -3413,7 +3545,7 @@ def wants_help(argv):
 
     Both files are permanent and tracked, with `-h` baked into the name, from a flag the user typed
     to find out what the command does. Two further commands escaped only because their argument
-    happened to be consumed first — by accident, not by design (R6 acc3, which swept the whole set
+    happened to be consumed first — by accident, not by design (R6, which swept the whole set
     rather than reporting one).
 
     An exact bare `-h` element is never a legitimate title, note or filename: a quoted title
@@ -3506,7 +3638,7 @@ def _config_problem(path):
     try:
         parsed = json.loads(text)
     except json.JSONDecodeError as err:
-        # 🐛 [2026-09-24] (R45 acc4, 2026-09-24) "does not parse" was the whole message -- true, and
+        # 🐛 [2026-09-24] (R45, 2026-09-24) "does not parse" was the whole message -- true, and
         # useless for finding the stray comma or quote in a file with more than a couple of lines.
         # `JSONDecodeError` already carries where it gave up; `json.JSONDecodeError` is caught ahead
         # of the bare `ValueError` below (it is a subclass of it) only so this branch sees it before
@@ -3531,7 +3663,7 @@ def _config_problem(path):
 # does not fail. It WALKS UP and answers about the nearest real repository above it.
 #
 # Twelve call sites shelled out to `git -C root ...` on that assumption and every one of them was
-# reporting somebody else's repository (R6 acc3, 2026-09-06, first ten minutes). Reproduced: in a directory
+# reporting somebody else's repository (R6, 2026-09-06, first ten minutes). Reproduced: in a directory
 # holding one file and an empty `.git/`, nested inside a real repository, the session-start block
 # said "10 uncommitted file(s)" and named a branch — the ANCESTOR's status; `chamnan-map` stamped
 # `Built from <sha>` into MAP.md with the ancestor's HEAD; and `--install-git-hook` resolved
