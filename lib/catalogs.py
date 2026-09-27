@@ -154,8 +154,15 @@ ENV_IN_CODE = re.compile(
     # Python `os.environ["X"]` is how you say the variable is REQUIRED, and `.get()` is how you
     # say it is optional. The ones most worth listing were the ones not listed.
     r"""(?:os\.environ\[\s*["']([A-Z][A-Z0-9_]{2,})["']"""
-    r"""|os\.environ(?:\.get)?\s*\(\s*["']([A-Z][A-Z0-9_]{2,})["']"""
-    r"""|os\.getenv\s*\(\s*["']([A-Z][A-Z0-9_]{2,})["']"""
+    # 🐛 [2026-09-26] (R18, 2026-09-26) `setdefault`/`pop` and a bare `getenv(` (from
+    # `from os import getenv`) were missed. Measured over a real virtualenv's site-packages and
+    # chamnan-corpus before adding: 3 and 7 matches, every one a real environment read. The bare
+    # `environ[...]`/`environ.get(` forms were measured too and REFUSED: all three `environ[`
+    # matches were WSGI request keys (`CONTENT_TYPE`), which is the request dict, not the process
+    # environment. Vite's `import.meta.env.X` and `const {X} = process.env` had no sample at all,
+    # so they stay out until one is measured.
+    r"""|os\.environ(?:\.get|\.setdefault|\.pop)?\s*\(\s*["']([A-Z][A-Z0-9_]{2,})["']"""
+    r"""|(?<![\w.])(?:os\.)?getenv\s*\(\s*["']([A-Z][A-Z0-9_]{2,})["']"""
     r"""|process\.env\.([A-Z][A-Z0-9_]{2,})"""
     r"""|process\.env\[\s*["']([A-Z][A-Z0-9_]{2,})["']"""
     r"""|ENV\[\s*["']([A-Z][A-Z0-9_]{2,})["']"""
@@ -602,6 +609,12 @@ def _is_ignored(root, path):
     return _ignored_by_files(Path(root), Path(path))
 
 
+def _ancestors(rel):
+    """The directories above a posix relative path: `a/b/c.txt` gives `a` and `a/b`."""
+    parts = rel.split("/")[:-1]
+    return ["/".join(parts[:i]) for i in range(1, len(parts) + 1)]
+
+
 def _ignored_by_files(root, path):
     # Asked once per call rather than once per pattern: `tree.git_folds_case` caches per root, but
     # the lookup still costs a dict hit inside the pattern loop below.
@@ -648,7 +661,14 @@ def _ignored_by_files(root, path):
                 if negated and _parent_dir_excluded:
                     continue
                 verdict = not negated
-                if not negated and pat.endswith("/"):
+                # 🐛 [2026-09-25] Only a pattern written with a trailing `/` used to count as
+                # excluding a directory. A bare `build` excludes the directory just the same, so
+                # `build` + `!build/keep.txt` re-included the file here while `git check-ignore`
+                # kept it ignored. What matters is whether the rule matched a directory ABOVE the
+                # file, whatever its spelling (R207, 2026-09-25).
+                if not negated and any(
+                        tree.gitignore_matches(a, pat, _fold() if callable(_fold) else _fold)
+                        for a in _ancestors(rel)):
                     _parent_dir_excluded = True
     return verdict
 

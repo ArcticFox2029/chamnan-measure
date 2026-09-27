@@ -571,7 +571,9 @@ AUTHORSHIP_HEADER = re.compile(
     # 🐛 Stepping over `Author:` alone was not enough, and the realistic header is the one that got
     # through: `# Author: Jane Roe` followed by `# Email: jane@example.com` published the address on
     # the next line instead. Contact fields carry exactly what the author line does.
-    r"|e-?mails?|contacts?)\s*::?"
+    # `owners?` and `point of contact` are the same header under a different name: a repo's
+    # CODEOWNERS-style convention writes `Owner:` above the same name-and-address shape.
+    r"|e-?mails?|contacts?|owners?|point\s+of\s+contact)\s*::?"
     r"|^\s*written\s+by\b", re.I)
 # A line that is essentially just an address is a contact line without the label — some headers
 # write the address alone under the name. Anchored on the whole line being one address so a summary
@@ -1912,17 +1914,24 @@ def indexable(root, nested=None, with_text=False, sniff=True):
             if lines_here > MAX_FILE_LINES:
                 SKIPPED_TOO_MANY_LINES.append((path, lines_here))
                 continue
-            if b"\x00" in raw[:8192]:
+            # 🐛 [2026-09-25] (R217, 2026-09-25) The NUL test ran before any BOM was looked at, so a
+            # UTF-16 source file -- a NUL beside every ASCII byte -- was reported as "binary despite
+            # a source suffix" and never indexed. Windows PowerShell 5.1 saves .ps1 as UTF-16 by
+            # default. gemini-cli had the same ordering bug; peek.py here already checks the BOM
+            # first. A NUL with no BOM in front of it is still a real binary.
+            bom = _bom_encoding(raw)
+            if bom is None and b"\x00" in raw[:8192]:
                 SKIPPED_BINARY.append(path)
                 continue
-            text = raw.decode("utf-8-sig", errors="replace")
+            text = raw.decode(bom or "utf-8-sig", errors="replace")
             if "\r" in text:
                 text = text.replace("\r\n", "\n").replace("\r", "\n")
             yield path, lang, text
         elif sniff:
             try:
                 with path.open("rb") as fh:
-                    if b"\x00" in fh.read(8192):
+                    _head = fh.read(8192)
+                    if _bom_encoding(_head) is None and b"\x00" in _head:
                         SKIPPED_BINARY.append(path)
                         continue
             except OSError:
@@ -1937,6 +1946,16 @@ def indexable(root, nested=None, with_text=False, sniff=True):
             # 16-39 seconds per firing, against the docstring's own claim of "0.04s on a 1,478-file
             # repository". The caller re-checks the handful of files that are actually newer.
             yield path, lang
+
+
+def _bom_encoding(raw):
+    """The codec a leading byte-order mark names, or None. UTF-32 first: its little-endian mark
+    begins with UTF-16's."""
+    if raw[:4] in (b"\xff\xfe\x00\x00", b"\x00\x00\xfe\xff"):
+        return "utf-32"
+    if raw[:2] in (b"\xff\xfe", b"\xfe\xff"):
+        return "utf-16"
+    return None
 
 
 def reset_skips():
@@ -1982,6 +2001,17 @@ def _scan(root):
         # line is useful; a traceback is not, and it takes the other 195 files with it.
         try:
             doc, funcs, classes, consts = _extract_one(source, path, lang)
+            # \U0001f41b [2026-09-25] (R217, 2026-09-25) `text = raw.decode(bom or "utf-8-sig",
+            # errors="replace")` in `indexable()` turns every byte a source encoding doesn't own
+            # into U+FFFD, and a comment or docstring read out of that text carried the replacement
+            # characters straight into MAP.md — a Shift-JIS file's Japanese opening comment came out
+            # `��タ�@...`, mojibake committed into the index rather than left out
+            # of it. Guessing the real encoding is out of scope here (see `_bom_encoding` above,
+            # which only reads what the file itself declares); the fix is to not emit text that is
+            # already known to be wrong. Line count and symbol counts stand regardless — only the
+            # one-line description is dropped.
+            if "�" in doc:
+                doc = ""
             # _sfc_extraction_source is a no-op for every extension but .svelte/.vue/.astro, so this
             # stays the plain `_is_empty_module(source, lang)` everywhere else. For those three, an
             # empty extraction (no <script>, no frontmatter) must count as nothing-to-describe here

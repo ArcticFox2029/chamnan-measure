@@ -726,7 +726,15 @@ _LATIN_SECRET_WORDS = (
     # `entic` covers authentication, authenticate, authenticates, authenticated, authenticator and
     # authenticity in one: only `authentication` was excluded, so a sentence saying what a gate
     # "authenticates" lost its last word. Prose is the other half of this module's trade.
-    r"|(?<![A-Za-z])auth(?!ors?\b|entic|orit)"
+    # \U0001f41b [2026-09-26] The `ors?\b` half only excluded "author"/"authors" as a WHOLE word --
+    # `\b` needs a word boundary right after the "or", which "authored", "authority" and
+    # "AUTHOR_EMAIL" never reach (an "e", another letter, or "_" all count as more word). Measured:
+    # a commit trailer's own "Co-Authored-By" and "GIT_AUTHOR_EMAIL" were both flagged. Replaced
+    # with a lookahead keyed on what comes AFTER "or" instead of on a boundary after it: any
+    # "auth" + "or..." is excluded UNLESS that "or" is followed by "is"/"iz" (authorize,
+    # authorise, authorization all keep the word secret; author, authors, authored, authority and
+    # AUTHOR_EMAIL do not). (R81, 2026-09-25)
+    r"|(?<![A-Za-z])auth(?!or(?!i[sz])|entic)"
     # 🐛 [2026-09-08] Every branch above needs a separator or a capital to find the second
     # component, and one whole family of spellings has neither: `APIKEY=`, `DBPASSWORD=`,
     # `SECRETKEY=` are how environment variables are written in real `.env` files and CI settings,
@@ -1788,6 +1796,81 @@ _DEFAULT_CREDENTIALS = frozenset("""
     password passwd admin administrator root toor guest test changeme change_me
     letmein qwerty abc123 iloveyou postgres mysql oracle sysadmin
 """.split())
+
+# Words that stand where a value would, in code, and are never a credential: a keyword a case label
+# returns, or the type a TypeScript/Python annotation names.
+_CODE_WORDS = frozenset((
+    "return", "true", "false", "null", "nil", "none", "undefined", "self", "this", "new", "await",
+    "string", "number", "boolean", "bool", "any", "unknown", "void", "never", "object",
+    "int", "str", "float", "bytes", "optional"))
+_EXPRESSION_KEYWORDS = frozenset(("return", "await", "new"))
+_SUBSCRIPT_REF = re.compile(r"""^[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*\[['"][\w.-]+['"]\]!?$""")
+_CODE_NAME = re.compile(r"^[A-Za-z_$][A-Za-z_$]*(?:\.[A-Za-z_$][A-Za-z_$]*)*$")
+
+
+def _is_a_code_reference(match):
+    """True when an UNQUOTED value is a name in code -- a variable, a field, a lookup -- not a secret.
+
+    🐛 [2026-09-26] (R71, 2026-09-24) Measured on the corpus: 100 of 304 removed spans (planted
+    secrets aside) were code, not credentials -- `idempotencyKey: idempotencyKey,` (a Swift argument
+    label), `orderingKey: shipment,`, `partition_key = shipment_id`, `json['access_token'] as
+    String?`, `pushToken: string | null`, `value_key: of_geo_grpc_addr }`. Each is a secret WORD in
+    the key and a reference in the value; redacting it hides nothing and breaks the line a reader
+    needs. What decides it is the context a literal never has: a trailing `,` `)` `}` (an argument
+    or an object field), or `name = other_name` with spaces in code. Kept out on purpose, so a real
+    unquoted secret still goes: any value with a digit, any key in UPPER_CASE (an `.env` line), and
+    a plain word after a spaced `=` (`password = correcthorse` in an INI file). The quoted rule is
+    untouched: a quoted value is a literal.
+    """
+    raw = match.group(2) or ""
+    value = raw.rstrip(",;!")
+    if _SUBSCRIPT_REF.match(value.rstrip(")}")):
+        return True
+    value = value.rstrip(")}]")
+    after = match.string[match.end():match.end() + 4].lstrip()[:1]
+    # A keyword that opens an expression (`case .issueToken: return value`) is code whatever follows
+    # it. Any other code word has to END the value: `password: unknown ask the platform team` is
+    # prose whose first word happens to be a TypeScript type, and the words after it give it away.
+    if value.lower() in _EXPRESSION_KEYWORDS:
+        return True
+    if value.lower() in _CODE_WORDS and (raw[-1:] in ",;)}]" or after in ("", ",", ";", ")", "}",
+                                                                           "]", "|", "=", "?", ">")):
+        return True
+    written = re.sub(r"^['\"]+|['\"\s:=]+$", "", _full_key_at(match).strip())
+    key = written.lower()           # `_bare_key` lowercases, and the case is the whole point below
+    letters = re.sub(r"[^A-Za-z]", "", written)
+    if not letters or letters.isupper() or not _CODE_NAME.match(value):
+        return False
+    spaced = re.search(r"\s=\s*$", match.group(1) or "") is not None
+    shaped = "_" in value or "." in value or re.search(r"[a-z][A-Z]", value) is not None
+    same = (re.sub(r"[^a-z]", "", value.lower())
+            == re.sub(r"[^a-z]", "", key.lower().rsplit(".", 1)[-1]))
+    listed = raw[-1:] in ",)}" or after in (",", ")", "}")
+    # Inside `{ … }` a trailing comma is an object field, and a plain word there is a value like any
+    # other: `{"password": secretvaluehere, "x": 1}`. Only a parameter list makes a bare word a name.
+    if listed and not shaped and not same and _nearest_opener(match.string, match.start()) == "{":
+        listed = False
+    if listed:
+        return True
+    if same and value.lower() not in _DEFAULT_CREDENTIALS:
+        return True
+    return shaped and spaced
+
+
+def _nearest_opener(text, at):
+    """The innermost bracket still open at `at` on its line -- `(`, `[`, `{` -- or '' when none is."""
+    depth = {")": 0, "]": 0, "}": 0}
+    pairs = {"(": ")", "[": "]", "{": "}"}
+    for ch in reversed(text[text.rfind("\n", 0, at) + 1:at]):
+        if ch in depth:
+            depth[ch] += 1
+        elif ch in pairs:
+            if depth[pairs[ch]]:
+                depth[pairs[ch]] -= 1
+            else:
+                return ch
+    return ""
+
 
 def _value_is_the_key_itself(key_part, value):
     """Whether the value is just the key's own name — a label, never a credential.
@@ -3029,6 +3112,7 @@ def scrub(text, windowed=True, *, _unmask=True):
         or _is_documented_prose(m)
         or _is_a_template_under_a_weak_name(m.group(1), m.group(2))
         or _names_where_it_lives(m.group(2))
+        or _is_a_code_reference(m)
         # The tail is appended only when the whole value became a PLACEHOLDER. When
         # `_redact_literals_in` rewrites the value instead, what it returns already CONTAINS that
         # tail -- appending it again duplicated the bracket, which the same idempotence relation

@@ -9,7 +9,6 @@ rebuilding their own — and a machine move carries it along with the clone.
 import re
 import hashlib
 import json
-import secrets
 import time
 import contextlib
 import pathlib
@@ -37,7 +36,7 @@ _PERSONS_ENV = dict(os.environ)
 def _stdout_is_gone():
     """Whether stdout's reader has gone, asked of stdout itself rather than of an exception's type.
 
-    🐛 [2026-09-25] (self-measured, CI) On Windows under Python 3.8 a write into a closed pipe raises
+    🐛 [2026-09-25] (self-measured) On Windows under Python 3.8 a write into a closed pipe raises
     `OSError: [Errno 22] Invalid argument`, not `BrokenPipeError`, so a check on the type alone
     missed it there and the command still exited 120. A flush that fails is the one answer that
     holds on every platform.
@@ -687,7 +686,20 @@ def find_root(start=None):
     A `.git` is the stronger statement of "this is a repository". Nearest wins; workspace breaks the
     tie."""
     here = Path(start or os.getcwd()).resolve()
+    # 🐛 [2026-09-26] (self-measured) The walk went past the home folder. A `~/.chamnan` -- made there
+    # by accident, by a tool run from the wrong directory -- then claimed every folder under home
+    # that had no `.git`: a session in such a folder recorded its logs into it, and `chamnan-map`
+    # started indexing the entire home directory. A `.git` in home (dotfiles kept in git) does the
+    # same. Home and everything above it is never a repository found by walking UP; starting there
+    # on purpose still works.
+    try:
+        home = Path.home().resolve()
+        above = {home, *home.parents}
+    except (OSError, RuntimeError, KeyError):
+        above = set()
     for candidate in (here, *here.parents):
+        if candidate != here and candidate in above:
+            break
         if (candidate / WORKSPACE_DIRNAME).is_dir():
             return candidate
         if any((candidate / m).exists() for m in VCS_MARKERS):
@@ -932,16 +944,33 @@ def append_jsonl(root, rel, row, keep):
         a legitimately different shape.
 
     Telemetry must never be the thing that breaks a session, so every failure returns False.
+
+    🐛 [2026-09-26] (R59, 2026-09-26) Every call parsed the whole file and rewrote all of it, and
+    the file-pointer hook calls this on every Read. Measured at the 2,000-record ceiling
+    `pointer.jsonl` and `long_reads.jsonl` carry: 19 ms and ~370 KB written per call, to add one
+    ~190-byte line -- the write amplification a published agent CLI was measured paying at 11 MB/s.
+    Now a call appends its line, and only one that finds the file a quarter past `keep` parses and
+    rewrites it down to `keep`. The file therefore holds up to 1.25 x `keep` between trims. A torn
+    tail (a writer killed mid-line) is closed with a newline first, so it costs that line and not
+    the next one too; it never parses, so the trim drops it like any other broken line.
     """
     try:
+        if read_only():
+            return False
         log = workspace(root) / rel
         log.parent.mkdir(parents=True, exist_ok=True)
         with exclusive(log) as held:
             if not held:
                 return False
+            raw = log.read_bytes() if log.is_file() else b""
+            if raw.count(b"\n") < keep + max(keep // 4, 1):
+                line = json.dumps(row, separators=(",", ":"), ensure_ascii=False) + "\n"
+                with open(log, "ab") as fh:
+                    fh.write((b"\n" if raw and not raw.endswith(b"\n") else b"") + line.encode("utf-8"))
+                return True
             prior = []
-            if log.is_file():
-                for line in log.read_text(encoding="utf-8-sig", errors="replace").splitlines():
+            if raw:
+                for line in raw.decode("utf-8-sig", errors="replace").splitlines():
                     try:
                         one = json.loads(line)
                     except (json.JSONDecodeError, RecursionError):
@@ -960,6 +989,8 @@ def append_jsonl(root, rel, row, keep):
 SELF_PRUNING_LOGS = ("commands.jsonl", "pointer.jsonl", "scratch.jsonl", "edits.jsonl",
                     "subagent_start.jsonl", "block_shape.jsonl", "gate_runs.jsonl",
                     "failures.jsonl",
+                    # One row per hook crash that `never_fail` kept from taking a session down.
+                    "hook_errors.jsonl",
                     # One row per subagent run, bounded by record like the rest: what it cost and
                     # whether it ran on the model its own file declares. A cost history is worth
                     # having only if it is long enough to compare against, which an age sweep would
@@ -1682,6 +1713,49 @@ def _quarantine(path, why):
     return str(dest)
 
 
+def preserve_before_rewrite(path, text, why):
+    """Keep a corrupt store's bytes before a `rewrite_shared` mutate replaces them with fresh
+    content. Returns where the copy went, or "" when there was nothing to keep or the copy failed.
+
+    🐛 [2026-09-27] (R118 acc5, 2026-09-27) `_quarantine` above is for the READ side —
+    `load_json(..., quarantine=True)` moves a store aside the moment it fails to parse. The REWRITE
+    side had no equivalent: `schedule._rewrite` calls `ws.rewrite_shared(p, lambda text:
+    _dump(change(_rows_from(text))))`, and `_rows_from` returns `[]` for text that is not valid
+    JSON or has the wrong shape. So when `state/scheduled.json` was corrupt, the next `add()` or
+    `update()` built its fresh content from an empty list plus the one new record, and the write
+    below put THAT on disk — every earlier scheduled record gone, silently, with no copy kept. That
+    is exactly what `_quarantine`'s own docstring calls out: "Never a silent reset, and never a
+    delete — the corrupt file is the only copy of whatever was in it."
+
+    This cannot behave like `_quarantine` and move the real file aside: it runs INSIDE a
+    `rewrite_shared` mutate, with `path` locked and about to be overwritten by `rewrite_shared`
+    itself once this mutate returns. Moving or replacing `path` here would race the caller's own
+    write, so this only ever creates a NEW sibling file (`<name>.corrupt.<timestamp>`, same naming
+    as `_quarantine`) holding a copy of the text the mutate was handed, and appends the same record
+    shape to `QUARANTINE_LOG`. Never raises — a mutate that cannot preserve a copy must still be
+    allowed to proceed with the rewrite, the same judgement `_quarantine` makes for a read.
+    """
+    try:
+        if not text:
+            return ""
+        path = pathlib.Path(path)
+        dest = path.with_name(path.name + ".corrupt."
+                              + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S"))
+        if not atomic_write_text(dest, text):
+            return ""
+    except Exception:              # noqa: BLE001 — a mutate must not fail because of this
+        return ""
+    try:
+        root = find_root(path)
+        if root is not None:
+            append_jsonl(root, QUARANTINE_LOG,
+                         {"at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                          "file": path.name, "why": str(why)[:120], "kept_as": dest.name}, 500)
+    except Exception:              # noqa: BLE001 — recording a recovery must not break one
+        pass
+    return str(dest)
+
+
 def load_json(path, want=dict, quarantine=False):
     """A JSON store read back, or an empty one of the right type. Never raises, never wrong-typed.
 
@@ -1839,6 +1913,12 @@ LAST_CONFIG_KEYS_KEPT = []
 # the reader learns which of their settings are silently doing nothing instead of finding out from
 # the behaviour they expected not happening. List of `(key, value, wants)` tuples.
 LAST_CONFIG_KEYS_IGNORED = []
+
+# Unknown keys `ensure()` kept because they are close to a real one, as `(key, meant)` pairs — a
+# typo does nothing, and it is named at session start rather than dropped (R231).
+LAST_CONFIG_KEYS_MISSPELT = []
+# How close an unknown key must be to a real one to be taken for its typo; see `_merged`.
+CONFIG_TYPO_CUTOFF = 0.85
 
 
 def _newer_version_has_been_here(root):
@@ -2004,6 +2084,27 @@ def ensure(root=None):
                 if k not in DEFAULT_CONFIG:
                     merged[k] = v
                     kept_newer.append(k)
+        else:
+            # 🐛 [2026-09-25] (R231, 2026-09-25) A MISSPELT key was dropped like a retired one:
+            # `{"log_retention_dayz": 30}` vanished from the file on the next session, the 7-day
+            # default went on deleting logs, and nothing said a word. A key close to a real one is
+            # a typo far more often than a retired option, so it is kept as written and named with
+            # the key it was probably meant to be. The two closest real keys
+            # (`log_retention_days` / `session_retention_days`) score exactly 0.8, and a cutoff is
+            # inclusive, so it sits above that: no real key reads as another's typo, while a
+            # one-letter slip on even a three-letter key (`maps`, 0.857) is still caught.
+            # Skipped when a newer build has been here: its keys are kept above.
+            import difflib
+            misspelt = []
+            for k, v in current.items():
+                if k in DEFAULT_CONFIG:
+                    continue
+                near = difflib.get_close_matches(str(k), list(DEFAULT_CONFIG), n=1, cutoff=CONFIG_TYPO_CUTOFF)
+                if near:
+                    merged[k] = v
+                    misspelt.append((k, near[0]))
+            if misspelt:
+                LAST_CONFIG_KEYS_MISSPELT[:] = misspelt
         if kept_newer:
             LAST_CONFIG_KEYS_KEPT[:] = sorted(kept_newer)
         if merged == current:
@@ -3490,6 +3591,9 @@ def nonce_for(session_id):
     to stop being identical (R1, the duplicate-body sweep).
     """
     if not session_id:
+        # Imported here: `secrets` pulls in random, hmac and base64, ~7 ms that every hook paid at
+        # import for a fallback almost no call reaches (R81, 2026-09-26).
+        import secrets
         return secrets.token_hex(3)          # no id in the payload: fall back to a random marker
     return hashlib.blake2s(str(session_id).encode("utf-8"), digest_size=3).hexdigest()
 
@@ -3518,7 +3622,50 @@ def never_fail(main):
     try:
         return main()
     except Exception:      # noqa: BLE001 — the whole point: a hook must not take a session down
+        _record_swallowed()
         return 0
+
+
+HOOK_ERRORS = "logs/hook_errors.jsonl"
+
+
+def _record_swallowed():
+    """Leave one line saying a hook crashed: which hook, what was raised, and at which line.
+
+    🐛 [2026-09-25] (R145, 2026-09-25) `never_fail` kept a crashed hook from taking the session
+    down, and in doing so hid it for good: stderr of a hook that exits 0 goes only to the host's
+    debug log, and nothing in the workspace recorded it, so a hook could fail on every call for
+    weeks and nobody would know. JetBrains' answer to the same problem is to attribute the error
+    to the plugin that raised it and say so. Here the crash is recorded, and the session line and
+    `chamnan-doctor` report it. The exception's message is not kept: it can carry a path or a
+    value from the person's repository, and the type and line are enough to find the bug.
+    Recording must never become a second failure, so every error in here is dropped.
+    """
+    try:
+        import traceback
+        exc = sys.exc_info()[1]
+        frames = traceback.extract_tb(exc.__traceback__) if exc is not None else []
+        pkg = str(Path(__file__).resolve().parent.parent)
+        # Per frame, and guarded: a frame from `python -c` or from importlib is named `<string>`
+        # or `<frozen ...>`, and on Windows Python 3.8 resolving that name raises OSError
+        # (WinError 123) -- unguarded, one such frame would drop the whole record.
+        def _ours(frame):
+            try:
+                return str(Path(frame.filename).resolve()).startswith(pkg)
+            except (OSError, ValueError):
+                return False
+        ours = [f for f in frames if _ours(f)] or frames
+        root = hook_root(None)
+        if root is None or read_only() or not workspace(root).is_dir():
+            return
+        append_jsonl(root, HOOK_ERRORS, {
+            "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "hook": Path(sys.argv[0]).name,
+            "error": type(exc).__name__ if exc is not None else "",
+            "where": ("%s:%d" % (Path(ours[-1].filename).name, ours[-1].lineno)) if ours else "",
+        }, 200)
+    except Exception:      # noqa: BLE001 — recording a crash must not be a second one
+        pass
 
 
 def version_line():
