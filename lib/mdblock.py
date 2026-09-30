@@ -81,6 +81,11 @@ def fenced_lines(text):
 #
 # Whitespace is FOLDED to a space and everything else is deleted. That is what the docstring
 # always said this function does.
+# The shape of a session fence marker, `[repo:ab12cd]` or `[/repo:ab12cd]`, whatever its nonce. One
+# definition for the two hooks that neutralise fence-shaped text and the adapter that compares a
+# snapshot's sections with a session's, so the three cannot disagree about what a fence is.
+FENCE_SHAPED = re.compile(r"\[(/?)repo:[0-9a-fA-F]{6}\]")
+
 _WHITESPACE = "\t\n\v\f\r"
 _CONTROLS = str.maketrans(
     {**{c: " " for c in _WHITESPACE + "\x85"},
@@ -573,8 +578,17 @@ def filesystem_key(name):
     nobody needed, and the opposite error is one file quietly replacing another with nothing on
     screen. A key that over-matches costs a reader a glance; a key that under-matches costs them the
     file. Measured 2026-09-08 (R7 agent 1, 2026-09-09).
+
+    🐛 [2026-09-28] (R36 acc4, 2026-09-28) NFC-then-casefold under-matched: `casefold()` can emit a
+    decomposed sequence, so `ΐ` and `Ϊ́` got different keys while APFS keeps
+    only one of the two files -- measured on this machine, 4 of 4 such pairs collapsed. Over every
+    code point, 19 were canonically caseless-equal to a spelling this key called different, all
+    Greek with dialytika, tonos or iota subscript (U+0345, which Unicode names as the reason). The
+    fold is now Unicode's canonical caseless match, NFD(casefold(NFD(x))), recomposed to NFC so a
+    key still reads as the name it came from.
     """
-    return unicodedata.normalize("NFC", name).casefold()
+    folded = unicodedata.normalize("NFD", unicodedata.normalize("NFD", name).casefold())
+    return unicodedata.normalize("NFC", folded)
 
 
 def canonical_title(source):

@@ -115,12 +115,13 @@
 <style>
 /* 🐛 [2026-09-25] (R141, 2026-09-25) --faint carries every small caption and card heading here, and
    measured 2.95:1 (light) and 3.51:1 (dark), under the 4.5:1 WCAG asks of text that size. Both
-   themes now reach it; check 283 holds this page and the dashboard to it. */
+   themes now reach it; check 283 holds this page and the dashboard to it.
+   (R74 acc2, 2026-09-30) --warn on --warn-soft in .simtag measured 4.33:1; darkened to 9B5C0B. */
 :root{
   --ground:#FBFBF8; --surface:#FFFFFF; --sunk:#F4F4EF;
   --ink:#15181C; --muted:#5C6169; --faint:#6C7075;
   --rule:#E4E3DD; --accent:#0F6E5C; --accent-soft:#E4F0EC;
-  --warn:#A2600C; --warn-soft:#F8EEDD;
+  --warn:#9B5C0B; --warn-soft:#F8EEDD;
   --mono:"IBM Plex Mono",ui-monospace,SFMono-Regular,Menlo,monospace;
   --sans:"IBM Plex Sans",system-ui,-apple-system,Segoe UI,sans-serif;
 }
@@ -985,7 +986,9 @@ function applyLang(code){
 const PRE = [
   // Measured 2026-09-07 through THIS page in a real browser, re-measured on each release with
   // `site/remeasure.py`, which takes the same listing, the same filters and the same modules
-  // without one. Last re-measured 2026-09-27 for 1.33.0, all fourteen via Python 3.12 (1.32.0 was
+  // without one. Last re-measured 2026-09-30 for 1.34.0, all fourteen via Python 3.12: source moved
+  // on one, tokio-rs/tokio 3,491 to 3,496 KB, its ratio 555 to 556. Before that, 2026-09-27 for
+  // 1.33.0, all fourteen via Python 3.12 (1.32.0 was
   // deployed without a re-measure, so this covers both): source moved on three — chalk/chalk 56 to
   // 57 KB, gin-gonic/gin 673 to 674, tokio-rs/tokio 3,484 to 3,491 — and the injected column on one,
   // yumiaura/myCat 6,455 to 6,415, with two ratios moving by one. Before that, 2026-09-24 for
@@ -1014,7 +1017,7 @@ const PRE = [
   ["rails/rails","Ruby",1552,6438,247],
   ["django/django","Python",2210,6245,362],
   ["torvalds/linux","C",3028,6603,470],
-  ["tokio-rs/tokio","Rust",3491,6441,555],
+  ["tokio-rs/tokio","Rust",3496,6441,556],
   ["vuejs/core","TypeScript",3799,6250,622],
 ];
 const kb = n => n >= 1024 ? (n/1024).toFixed(n >= 10240 ? 0 : 1) + " KB" : n + " B";

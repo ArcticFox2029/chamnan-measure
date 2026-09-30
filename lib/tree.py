@@ -24,6 +24,7 @@ Reading every file to hash it, for comparison, costs 0.08s on the same repositor
 incremental index is ever built, this is the layer it should sit on, not a replacement for it.
 """
 import os
+import re
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -47,6 +48,15 @@ VCS_DIRS = (".git", ".hg", ".svn")
 PRUNE_DIRS = {"node_modules", "vendor", "__pycache__", ".venv", *VCS_DIRS}
 
 _CACHE = {}
+
+# 🐛 [2026-09-30] (R142 acc2, 2026-09-30) `files.sort()` on Path objects recomputed each path's
+# comparison key on every comparison: profiling `_walk` over 7,331 files (load ~30) showed
+# `Path.__lt__` running 55,128 times for 0.378 s of a 1.68 s walk, against 0.25 s for a bare
+# os.walk with the same pruning. The key is computed once per path here and is exactly what
+# `Path.__lt__` compares: the string split on the separator, lower-cased first on Windows.
+_SORT_PARTS_POSIX = lambda p: str(p).split("/")                    # noqa: E731
+_SORT_PARTS_WINDOWS = lambda p: str(p).lower().split("\\")         # noqa: E731
+_SORT_PARTS = _SORT_PARTS_WINDOWS if os.name == "nt" else _SORT_PARTS_POSIX
 
 
 def _walk(root):
@@ -175,7 +185,7 @@ def _walk(root):
                 UNREADABLE.add(str((rel_dir / name).as_posix()))
                 continue          # a broken, looping or unresolvable link is not indexable either
             files.append(rel_dir / name)
-    files.sort()
+    files.sort(key=_SORT_PARTS)
     return files, gits
 
 
@@ -203,6 +213,19 @@ def session():
         _DEPTH -= 1
         if _DEPTH == 0:
             _CACHE.clear()
+
+
+def session_memo(key, compute):
+    """`compute()` once per session for `key`; outside a session, every call computes fresh."""
+    # Scoped exactly like the walk cache, for the reason `session()` gives: a caller that scans,
+    # writes a file, and scans again outside a session must see the new file. The tuple slot cannot
+    # collide with `_entries`, whose keys are plain strings.
+    if not _DEPTH:
+        return compute()
+    slot = ("memo", key)
+    if slot not in _CACHE:
+        _CACHE[slot] = compute()
+    return _CACHE[slot]
 
 
 def _entries(root):
@@ -645,6 +668,22 @@ git_dirs = vcs_dirs
 # `mapper` beside it refused anything over this size. A 150 MB file hung `chamnan-peek` for over
 # 150 seconds (R7 agent 2, 2026-09-08, R8 agent 2).
 MAX_FILE_BYTES = 2_000_000
+
+# 🐛 [2026-09-30] (R68 acc2, 2026-09-30) `ast.parse` on Python 3.12+ is QUADRATIC in the number
+# of f-strings in one module (https://github.com/python/cpython/issues/155525), and neither
+# MAX_FILE_BYTES nor `mapper.MAX_FILE_LINES` sees it. A module of N lines `xI = f"{a}{b}{c}{d}{e}{f}{g}{h}"`, measured on 3.14.7:
+#     2,000 lines   71 KB   0.42 s        20,000 lines   0.73 MB    39.6 s
+#     4,000 lines  143 KB   1.93 s        40,000 lines   1.47 MB   134 s
+#     8,000 lines  287 KB   8.16 s
+# On 3.12.14 it is 0.76 s at 2,000 and 2.29 s at 4,000; 3.11 and 3.9 are linear (0.25 s / 0.55 s).
+# A 1.47 MB file passes MAX_FILE_BYTES and MAX_FILE_LINES, so one generated f-string-heavy module
+# stalled `chamnan-map`, which runs from the git hook, for minutes. One field per f-string is much
+# cheaper (8,000 of them, 119 KB, 0.68 s on 3.14). chamnan's own largest ordinary module has 38.
+# 5,000 openings is a few seconds on the worst Python and two orders of magnitude above real code.
+MAX_FSTRINGS = 5_000
+# An UPPER bound: an opening inside another string or a comment is counted too, which only makes
+# the cap trip earlier on a file that is not ordinary source anyway.
+FSTRING_OPEN = re.compile(r"""(?<![\w])(?:[rRbBuU]?[fFtT][rR]?|[rR][fFtT])(?:"|')""")
 
 
 def within_size(path, limit=MAX_FILE_BYTES):

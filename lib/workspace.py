@@ -14,6 +14,7 @@ import contextlib
 import pathlib
 import os
 import errno
+import unicodedata
 from datetime import datetime, timezone
 import sys
 from pathlib import Path
@@ -57,6 +58,37 @@ def _to_devnull():
         pass
 
 
+class WorkingDirectoryGone(FileNotFoundError):
+    """The directory this process started in has since been removed out from under it.
+
+    🐛 [2026-09-29] (R47 acc5, 2026-09-29) Subclasses `FileNotFoundError` on purpose: every
+    `except OSError` / `except Exception` already written in a hook or `bin/` command keeps
+    catching it exactly as before. This is a more specific name for a failure those already
+    guard against, not a new kind of failure to guard against.
+    """
+
+
+def current_dir():
+    """os.getcwd(), or WorkingDirectoryGone in place of Python's own bare traceback.
+
+    🐛 [2026-09-29] (R47 acc5, 2026-09-29) Ten `bin/` commands (chamnan-age, -context, -doctor,
+    -explain-context, -guard, -map, -open, -recall, -report, -setup) died with an uncaught
+    `FileNotFoundError: [Errno 2]` when run from a directory removed out from under them --
+    `cd` into it, `rmdir` it, then run the command. Nine of the ten hit this in `find_root`, at
+    a bare `os.getcwd()`; `chamnan-setup` hit the same error even earlier, building its
+    `--root` default. Wrapping the call once, here, means every caller gets one readable
+    sentence on stderr instead of a traceback -- see `_quiet_broken_pipe` below, which is what
+    turns the raise into that sentence for a caller that never catches it itself.
+    """
+    try:
+        return os.getcwd()
+    except FileNotFoundError:
+        raise WorkingDirectoryGone(
+            "the directory this was started in no longer exists -- "
+            "cd into the repository and run it again"
+        ) from None
+
+
 def _quiet_broken_pipe(kind, value, tb, _previous=sys.excepthook):
     if isinstance(kind, type) and (issubclass(kind, BrokenPipeError)
                                    or (issubclass(kind, OSError)
@@ -64,6 +96,13 @@ def _quiet_broken_pipe(kind, value, tb, _previous=sys.excepthook):
                                        and _stdout_is_gone())):
         _to_devnull()
         return
+    # 🐛 [2026-09-29] (R47 acc5, 2026-09-29) An uncaught WorkingDirectoryGone is the same shape
+    # of problem as the broken pipe above -- a condition outside the command's control that a
+    # Python traceback explains badly. One line to stderr and a non-zero exit says the same
+    # thing a person can act on; the traceback said only "FileNotFoundError: [Errno 2]".
+    if isinstance(kind, type) and issubclass(kind, WorkingDirectoryGone):
+        print("chamnan: %s" % (value,), file=sys.stderr)
+        sys.exit(1)
     _previous(kind, value, tb)
 
 
@@ -432,6 +471,12 @@ DEFAULT_CONFIG = {
     # store exactly where it was and only removes `chamnan-recall`.
     "recall": True,
     "agents": True,     # cheap models for scan-shaped work
+    # 🐛 [2026-09-29] (R18 acc4, 2026-09-29) The SubagentStart hook has read this switch since it was
+    # written, and its own comment calls it "switchable off in .chamnan/config.json like every other
+    # section" -- but the key was never declared here, and the merge drops every key that is not,
+    # so `"subagent_pointer": false` was silently discarded and the pointer could not be turned
+    # off. Found by deriving the keys the code reads and comparing them with this table.
+    "subagent_pointer": True,
     # Applied by prune_logs(), which every bin/ command calls. Without this the scratch log and
     # anything else written under logs/ would grow for the life of the repo — a workspace that
     # leaks disk is not one anybody keeps.
@@ -664,9 +709,52 @@ def inside(path, root, _resolved_root=None):
     """
     try:
         root_resolved = _resolved_root if _resolved_root is not None else Path(root).resolve()
-        return root_resolved in Path(path).resolve().parents
+        resolved_path = Path(path).resolve()
+        if root_resolved in resolved_path.parents:
+            return True
+        # 🐛 [2026-09-28] (R127 acc2, 2026-09-28) APFS is normalisation-insensitive: a folder
+        # written in NFD (e.g. "café-repo" with a combining accent) opens identically through an
+        # NFC spelling of the same name. `resolve()` does not normalise, so `root` and `path`
+        # spelled in different Unicode normal forms compared unequal above even though they name
+        # the same directory -- every file in such a repository read as outside it. Plain
+        # normalisation is not a safe fix on its own: on a byte-sensitive filesystem (Linux), an
+        # NFC directory and a distinct NFD sibling ARE two different directories, and treating them
+        # as the same one would be a containment escape. So the ancestor at `root`'s own depth is
+        # normalised only as a cheap pre-filter (skip the syscall on the ordinary truly-outside
+        # case), and `os.path.samefile` -- which compares device and inode, not spelling -- makes
+        # the actual decision.
+        depth = len(root_resolved.parts)
+        if len(resolved_path.parts) <= depth:
+            return False       # not a proper descendant of `root`, whatever the spelling
+        ancestor = Path(*resolved_path.parts[:depth])
+        if unicodedata.normalize("NFC", str(ancestor)) == unicodedata.normalize(
+                "NFC", str(root_resolved)):
+            return os.path.samefile(ancestor, root_resolved)
+        return False
     except (OSError, ValueError, RuntimeError):
         return False          # a broken or looping link is not inside anything
+
+
+def store_entries(directory_, root):
+    """Every `*.md` file directly in `directory_`, sorted, skipping a store's own README/index and
+    anything a symlink walks outside `root`. `[]` when `directory_` does not exist — the common
+    case for a store nobody has written to yet, not an error.
+
+    The shared body behind `timeline.threads()` and `candidates.entries()` — both list a store's
+    directory the same way BY COINCIDENCE, not because a thread and a candidate are the same
+    concept, so each module keeps its own public name and calls this rather than the two merging.
+
+    🐛 [2026-09-06] `inside()` guarded `memory/` and `skills/` and not `threads/`. A committed
+    symlink under `threads/` pointing outside the repository made `chamnan-timeline show` print
+    the full, unredacted content of whatever it named — an SSH config, internal prose, anything
+    the process can read. Nothing about that content is secret-SHAPED, so the redactor cannot
+    help; the refusal is the only thing that can. The workspace arrives with a clone, so the link
+    is the repository's choice and not the reader's (R9 agent 2, 2026-09-06).
+    """
+    if not directory_.is_dir():
+        return []
+    return sorted(p for p in directory_.glob("*.md")
+                  if p.is_file() and not is_store_index(p) and inside(p, root))
 
 
 def find_root(start=None):
@@ -685,7 +773,7 @@ def find_root(start=None):
 
     A `.git` is the stronger statement of "this is a repository". Nearest wins; workspace breaks the
     tie."""
-    here = Path(start or os.getcwd()).resolve()
+    here = Path(start or current_dir()).resolve()
     # 🐛 [2026-09-26] (self-measured) The walk went past the home folder. A `~/.chamnan` -- made there
     # by accident, by a tool run from the wrong directory -- then claimed every folder under home
     # that had no `.git`: a session in such a folder recorded its logs into it, and `chamnan-map`
@@ -772,6 +860,31 @@ def upper_bound(key):
     block that stops mid-sentence (R9 agent 3, finding 3).
     """
     return _UPPER_BOUND.get(key)
+
+
+# 🐛 [2026-09-27] (R169 acc4, 2026-09-27) `chamnan-doctor` and `chamnan-report` each carried their
+# own copy of this check, and neither had a place to say `CHAMNAN_OUTPUT_CEILING` was set at all --
+# exported once, then forgotten, it halved every session's block with `config.json` reading exactly
+# as shipped and nothing in either command explaining why. One home means the two readings can no
+# longer drift apart just because one copy was edited by hand and the other was not.
+def ceiling_env_status(raw):
+    """Whether `CHAMNAN_OUTPUT_CEILING`'s value is honoured or ignored.
+
+    The same rule `hooks/chamnan_session_start.py:_ceiling_from_env` applies -- a value that is not
+    a positive integer, or that exceeds `upper_bound("output_byte_ceiling")`, is ignored rather than
+    clamped. Calling `upper_bound` here rather than restating its number is the point: the bound and
+    this status can no longer read differently just because one of them was copied by hand.
+    """
+    try:
+        asked = int(str(raw).strip())
+    except (TypeError, ValueError):
+        return "ignored — not a whole number"
+    cap = upper_bound("output_byte_ceiling")
+    if asked > 0 and (cap is None or asked <= cap):
+        return "in force"
+    if asked <= 0:
+        return "ignored — must be positive"
+    return f"ignored — above the ceiling's bound of {cap}"
 
 
 def _in_range(key, value):
@@ -927,6 +1040,34 @@ def actor(payload):
     return out
 
 
+def jsonl_lines(text, keepends=False):
+    """Split JSONL text into candidate lines on `\\n` only -- never `str.splitlines()`.
+
+    🐛 [2026-09-28] (R123 acc2, 2026-09-28) `json.dumps(..., ensure_ascii=False)` escapes C0
+    controls but writes U+2028 LINE SEPARATOR, U+2029 PARAGRAPH SEPARATOR and U+0085 NEL RAW inside
+    a string value. `str.splitlines()` breaks on all three of those (plus \\x1c-\\x1e, \\x0b, \\x0c),
+    so a value carrying one turns one physical JSONL record into two unparseable fragments and the
+    record is silently lost -- including at trim time, where a reader like this one re-reads the
+    file and rewrites it, permanently deleting the record on the next trim. Reproduced: six records
+    each carrying one such character in a value, plus a plain one -- a `splitlines()` reader
+    recovered only 4 of 7 (losing LS, PS, NEL); splitting on "\\n" alone recovers all 7. A JSONL
+    record's own line break is "\\n" (optionally "\\r\\n" from a Windows-written file); it is never
+    any of the wider set `str.splitlines()` treats as a boundary, so this is not merely safer than
+    `splitlines()` for this format, it is what the format actually specifies.
+
+    `keepends=True` mirrors `str.splitlines(True)`: each returned line keeps its trailing `"\\n"`,
+    for a caller that reassembles the text with `"".join(...)` rather than `"\\n".join(...)`.
+    """
+    parts = text.split("\n")
+    if parts and parts[-1] == "":
+        parts = parts[:-1]
+    # A file decoded without universal-newline translation (raw bytes, `bytes.decode`) can still
+    # carry a trailing "\r" from a "\r\n" pair once split on "\n" alone; `Path.read_text` has
+    # already normalised that away, so this is a no-op there and a fix only where it is needed.
+    parts = [p[:-1] if p.endswith("\r") else p for p in parts]
+    return [p + "\n" for p in parts] if keepends else parts
+
+
 def append_jsonl(root, rel, row, keep):
     """Append one record to a workspace `.jsonl` and trim it to the newest `keep`. Never raises.
 
@@ -970,7 +1111,7 @@ def append_jsonl(root, rel, row, keep):
                 return True
             prior = []
             if raw:
-                for line in raw.decode("utf-8-sig", errors="replace").splitlines():
+                for line in jsonl_lines(raw.decode("utf-8-sig", errors="replace")):
                     try:
                         one = json.loads(line)
                     except (json.JSONDecodeError, RecursionError):
@@ -1680,6 +1821,27 @@ JSON_READ_CEILING = 4_000_000    # bytes
 QUARANTINE_LOG = "logs/recovered.jsonl"
 
 
+def _unused_corrupt_name(path):
+    """A `<name>.corrupt.<timestamp>` sibling of `path` that does not exist yet.
+
+    🐛 [2026-09-29] (R109 acc2, 2026-09-29) The name had one-second resolution and both writers
+    REPLACE an existing file, so two corrupt copies kept in the same second overwrote each other:
+    `x.json` written as `{bad 1` and loaded with `load_json(p, quarantine=True)`, then written as
+    `{bad 2` and loaded again, left ONE `.corrupt.` file holding `{bad 2`. The first copy was the
+    only copy of whatever it held. `_quarantine` and `preserve_before_rewrite` also collided with
+    each other. A numeric suffix keeps the `.corrupt.` infix that `chamnan-doctor` globs for.
+    """
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+    base = path.with_name(path.name + ".corrupt." + stamp)
+    if not base.exists():
+        return base
+    for n in range(1, 1000):
+        cand = base.with_name(base.name + "." + str(n))
+        if not cand.exists():
+            return cand
+    return path.with_name(path.name + ".corrupt." + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%f"))
+
+
 def _quarantine(path, why):
     """Move a store that cannot be read aside, and say so. Returns where it went, or ""..
 
@@ -1697,8 +1859,7 @@ def _quarantine(path, why):
         path = pathlib.Path(path)
         if not path.is_file():
             return ""
-        dest = path.with_name(path.name + ".corrupt."
-                              + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S"))
+        dest = _unused_corrupt_name(path)
         os.replace(path, dest)
     except OSError:
         return ""
@@ -1739,8 +1900,7 @@ def preserve_before_rewrite(path, text, why):
         if not text:
             return ""
         path = pathlib.Path(path)
-        dest = path.with_name(path.name + ".corrupt."
-                              + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S"))
+        dest = _unused_corrupt_name(path)
         if not atomic_write_text(dest, text):
             return ""
     except Exception:              # noqa: BLE001 — a mutate must not fail because of this
@@ -2928,7 +3088,7 @@ LOCK_READ_AFTER = 0.25
 LOCK_GIVEUPS = {"no_progress": 0, "waited_too_long": 0, "unexpected_error": 0, "taken": 0}
 
 
-def _replace_with_retry(tmp, dest, attempts=12, pause=0.02):
+def _replace_with_retry(tmp, dest, first_pause=0.02, max_pause=0.2, budget=1.0):
     """`os.replace`, which is not always allowed to proceed on Windows.
 
     🐛 On POSIX a rename over a path another process has OPEN is fine -- the reader keeps reading the
@@ -2937,20 +3097,29 @@ def _replace_with_retry(tmp, dest, attempts=12, pause=0.02):
     So a write here could fail purely because somebody was reading the file at that instant, and
     whatever the caller was saving was lost.
 
-    A reader holds a small file open for microseconds, so this waits rather than gives up: twelve
-    attempts over about a quarter of a second. If it still cannot land, the original exception is
-    raised -- a caller that cannot write must hear about it, not be told it succeeded.
+    A reader holds a small file open for microseconds, so this waits rather than gives up: the first
+    pause is 20 ms and each later one doubles, capped at 200 ms, until about a second has been slept
+    in total. If it still cannot land, the original exception is raised -- a caller that cannot write
+    must hear about it, not be told it succeeded.
 
     POSIX takes the first attempt every time and pays nothing for this.
     """
-    for n in range(attempts):
+    # 🎯 [2026-09-29] (R116 acc2, 2026-09-29) The old budget was 12 attempts at a flat 20 ms, about
+    # 0.24 s, the shortest of every implementation the round found. Outside, for the same Windows
+    # antivirus / EDR / indexer handles: uv 3 x 100 ms (0.3 s, fixed an EDR case on Windows 10/11),
+    # Chromium 5 x 100 ms, pnpm up to 1 s for access-denied, graceful-fs up to 60 s.
+    slept = 0.0
+    pause = first_pause
+    while True:
         try:
             os.replace(tmp, dest)
             return
         except PermissionError:
-            if n == attempts - 1:
+            if slept >= budget:
                 raise
             time.sleep(pause)
+            slept += pause
+            pause = min(pause * 2, max_pause)
 
 
 # Why the last `atomic_write_text` failed, for `write_or_raise` to put in its message. A list rather
@@ -3010,7 +3179,21 @@ def atomic_write_text(dest, text, encoding="utf-8"):
         # writes gets CRLF, including MAP.md, which is then diffed and grepped by tools that
         # were handed LF everywhere else. chamnan generates its own content and controls its
         # own line endings; nothing here wants the platform's opinion.
-        with tmp.open("w", encoding=encoding, newline="") as fh:
+        # 🐛 [2026-09-29] (R36 acc4, 2026-09-29) `tmp.open("w", ...)` follows a symlink: a symlink
+        # PLANTED at the staging name ahead of time, pointing outside this directory, made the
+        # write land inside whatever it pointed at, and the later `os.replace(tmp, dest)` then
+        # moved the symlink ITSELF over `dest` -- the destination became a symlink to someone
+        # else's file, not the new content. Removing whatever sits at `tmp` first -- never its
+        # target; unlinking a symlink drops only the link -- and then opening with O_EXCL |
+        # O_NOFOLLOW closes both halves: nothing can already be there to write through, and
+        # nothing re-planted between the unlink and the open is followed either.
+        try:
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                     | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0), 0o666)
+        with os.fdopen(fd, "w", encoding=encoding, newline="") as fh:
             fh.write(text)
             # 🎯 [2026-09-25] (R8, 2026-09-25) A rename is atomic against a dying PROCESS, not against
             # a power cut: without this the new name can survive a crash while the data behind it
@@ -3050,6 +3233,47 @@ def atomic_write_text(dest, text, encoding="utf-8"):
             except OSError:
                 pass
         return False
+
+
+# 🐛 [chamnan_scratch_watch.py, undated] The shared file was a read-modify-write with no lock, and
+# two sessions in one repository is normal rather than exotic -- 98 of 100 concurrent increments
+# were lost when it was measured at the function level. It stayed valid JSON the whole time, just
+# wrong, which is the lost update anomaly: an atomic write does not prevent it, only a lock
+# spanning read AND write, or not sharing the file at all. `lib/pointer.py` reached the same
+# conclusion for exactly the same shape of store and chose the same answer, with the reasoning
+# written out there.
+NUDGE_DEFAULT_MAX_AGE = 2 * 24 * 3600  # a session older than this is over; its marker is dead weight
+
+
+def nudge_path(wsdir, session_id, nudge_dir):
+    """One state file per session, never one shared dict keyed by session id — see the note above
+    for why a shared file is the wrong shape.
+
+    The shared body behind `chamnan_scratch_watch.py`'s and `chamnan_skill_pointer.py`'s own
+    `_nudge_path`. `nudge_dir` stays a caller-supplied argument rather than something this function
+    decides, because each hook keeps its OWN directory — a session-wide call counter and a
+    per-procedure ledger are different shapes of state, sharing only the file-per-session pattern.
+    """
+    safe = "".join(c if c.isalnum() or c in "-_" else "-" for c in str(session_id))[:64] or "none"
+    return wsdir / nudge_dir / f"{safe}.json"
+
+
+def nudge_write(wsdir, session_id, entry, nudge_dir, max_age=NUDGE_DEFAULT_MAX_AGE):
+    """Write one session's nudge-state JSON, then sweep sibling files older than `max_age` — the
+    eviction loop that replaces counting entries in one shared dict. Best-effort: silent on any
+    OSError, like every other write in this module that a hook must never fail loudly over.
+    """
+    if read_only():
+        return
+    p = nudge_path(wsdir, session_id, nudge_dir)
+    try:
+        # Shared `.tmp` name, same bug as pointer.py and chamnan-map had. See atomic_write_text.
+        atomic_write_text(p, json.dumps(entry))
+        for old in p.parent.glob("*.json"):
+            if old != p and time.time() - old.stat().st_mtime > max_age:
+                old.unlink()
+    except OSError:
+        pass
 
 
 NOTICE_TIMES = 3
@@ -3120,28 +3344,18 @@ def notice_due(root, key, times=NOTICE_TIMES):
     return True
 
 
-
-def _lock_holder_is_alive(lock):
-    """True when the process named inside `lock` still exists.
-
-    Read as a SECOND bound beside the age one, never instead of it: a lock written by an older
-    version carries no PID, and an unreadable or unparseable one falls back to "not alive" so the
-    age rule decides on its own exactly as it used to. The age bound alone is the one a wrong
-    clock can invert; the pair cannot both be wrong at once.
-    """
-    return _lock_holder_state(lock) == "alive"
-
-
+# 🧹 [2026-09-28] (R133 acc2, 2026-09-28) removed _lock_holder_is_alive: no caller anywhere (vulture + grep).
 LOCK_HOLDER_ALIVE, LOCK_HOLDER_DEAD, LOCK_HOLDER_UNKNOWN = "alive", "dead", "unknown"
 
 
 def _lock_holder_state(lock):
     """"alive", "dead", or "unknown" — and the third is not the same as the second.
 
-    🐛 [2026-09-07] `_lock_holder_is_alive` collapses "this lock names a process that no longer
-    exists" and "this lock names nobody" into one False, which is right for the age rule (it only
-    runs after LOCK_STALE, by which time either is old enough to break) and wrong for anything
-    that wants to act sooner. A lock is CREATED and its PID written a moment later, two separate
+    🐛 [2026-09-07] a boolean `_lock_holder_is_alive` (removed 2026-09-28, no callers) collapses
+    "this lock names a process that no longer exists" and "this lock names nobody" into one False,
+    which is right for the age rule (it only runs after LOCK_STALE, by which time either is old
+    enough to break) and wrong for anything that wants to act sooner. A lock is CREATED and its
+    PID written a moment later, two separate
     syscalls, so "names nobody" is also what a perfectly healthy holder looks like for a few
     microseconds — breaking on that would hand the same file to two writers, which is the one
     thing this mutex exists to prevent.
@@ -3248,7 +3462,12 @@ def exclusive(path):
             try:
                 st = lock.stat()
                 here = (st.st_mtime_ns, st.st_size, getattr(st, "st_ino", 0))
-                age = now - st.st_mtime
+                # 🐛 [2026-09-30] (R91 acc5, 2026-09-30) A lock whose mtime is in the FUTURE (the clock
+                # stepped back after it was made, a VM restore, a skewed volume) gave a negative age, so
+                # `age > LOCK_READ_AFTER` never held and a DEAD holder was never read: every locked write
+                # gave up after LOCK_TIMEOUT (held False, 2.00s, lock left). abs() is safe: a live
+                # holder is still read as alive and kept, and a fresh lock is near 0 either way.
+                age = abs(now - st.st_mtime)
             except OSError:
                 here, age = None, 0.0
             if here is not None and here != seen:
@@ -3494,7 +3713,8 @@ def git_hook_state(root, current_body=None):
     "stale" is chamnan's own hook, made from an older template. It is only ever returned when the
     caller passes the template it is comparing against; a caller that cannot know the current body
     gets "installed" exactly as before, because reporting drift it did not measure would be worse
-    than saying nothing.
+    than saying nothing. A chamnan hook that git will not run (no exec bit on POSIX) is also
+    reported as "stale", so the next `chamnan-map` refreshes it.
     """
     hooks = git_hooks_dir(root)
     if hooks is None:
@@ -3508,6 +3728,14 @@ def git_hook_state(root, current_body=None):
         return None
     if GIT_HOOK_MARKER not in existing:
         return "theirs"
+    # 🐛 [2026-09-29] (R136 acc4, 2026-09-29) A chamnan hook with the exec bit removed was still
+    # reported "installed". Reproduced on this Mac: `chamnan-map --install-git-hook` writes
+    # .git/hooks/pre-commit as -rwxr-xr-x and this said "installed"; after `chmod 644` it STILL said
+    # "installed", yet git silently ignores a hook without the executable bit (githooks
+    # documentation), so the commit guard never ran while every report said it did. Measured
+    # directly, so it is checked before the template comparison. Git for Windows ignores the bit.
+    if not _IS_WINDOWS and not os.access(target, os.X_OK):
+        return "stale"
     if current_body is None:
         return "installed"
     want = git_hook_stamp(current_body)
@@ -4223,3 +4451,43 @@ def git_cannot_answer():
     timeout is one. Named through `_subprocess()` so this file keeps the property above.
     """
     return (OSError, ValueError, NotImplementedError, _subprocess().SubprocessError)
+
+
+# 🐛 [2026-09-28] (R185 acc4, 2026-09-28) `-c core.quotePath=false` above turns off quoting for
+# non-ASCII bytes, but a double quote, a backslash or a control character in a path is ALWAYS
+# C-quoted by git — `core.quotePath` cannot suppress that half. So a `+++` header can still arrive
+# as `"b/weird\"name.txt"`, and reading it as plain text would leave the surrounding quotes and the
+# backslash escapes in the reported path. This reverses git's own quoting: C escapes (`\t`, `\"`,
+# `\\`) and `\NNN` octal-byte escapes decode back to the real UTF-8 name.
+# Since 2026-09-30 it serves both `bin/chamnan-guard` and `rollup._churn` (R56 acc2).
+def unquote_git_path(raw):
+    """Reverse git's C-quoting of `raw`, or return it unchanged when it was never quoted."""
+    if len(raw) < 2 or raw[0] != '"' or raw[-1] != '"':
+        return raw
+    body = raw[1:-1]
+    _SIMPLE = {"a": 0x07, "b": 0x08, "f": 0x0c, "n": 0x0a, "r": 0x0d, "t": 0x09, "v": 0x0b,
+               '"': 0x22, "\\": 0x5c}
+    out, i, n = bytearray(), 0, len(body)
+    while i < n:
+        c = body[i]
+        if c == "\\" and i + 1 < n:
+            nxt = body[i + 1]
+            if nxt in _SIMPLE:
+                out.append(_SIMPLE[nxt])
+                i += 2
+                continue
+            if nxt in "01234567":
+                j = i + 1
+                while j < n and j < i + 4 and body[j] in "01234567":
+                    j += 1
+                digits = body[i + 1:j]
+                out.append(int(digits, 8) & 0xFF)
+                i = j
+                continue
+            # An escape this reader does not recognise: keep it literal rather than guess.
+            out.extend(c.encode("utf-8"))
+            i += 1
+            continue
+        out.extend(c.encode("utf-8"))
+        i += 1
+    return out.decode("utf-8", "replace")

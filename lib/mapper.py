@@ -107,6 +107,10 @@ MAX_FILE_BYTES = tree.MAX_FILE_BYTES
 # any decode, for the same reason the size check happens before the read.
 MAX_FILE_LINES = 200_000
 
+# The f-string cap and its regex live in tree.py so refs.in_source shares one source of truth.
+MAX_FSTRINGS = tree.MAX_FSTRINGS
+_FSTRING_OPEN = tree.FSTRING_OPEN
+
 # What the last scan left out and why. Populated by indexable(), read by the caller that
 # reports coverage, so a skipped file is a number someone can see rather than an absence.
 SKIPPED_TOO_LARGE = []
@@ -265,20 +269,117 @@ def _scoped(holder, pat):
     return [f"{holder}/{lead}", f"{holder}/**/{lead}"]
 
 
-def _is_generated(rel, pats, fold=False):
-    """`rel` against gitattributes-style patterns. `**/` means any depth, and a pattern with no
-    slash in it applies at every level -- which is git's own rule, not fnmatch's.
+_GIT_PATTERN_RE = {}
+_NEVER = re.compile(r"(?!)")
 
-    `fold` is git's `core.ignorecase`, passed in by the caller that knows the root. It was
-    `fnmatch.fnmatch` here, which decides case-folding from `os.name` instead -- see
-    `tree.glob_matches` for the measurement.
+
+def _git_pattern_regex(pat):
+    """(case-sensitive, case-insensitive) compiled regexes for ONE gitattributes pattern.
+
+    Matched with `fullmatch` against a whole relative path using forward slashes. Follows git's
+    wildmatch rules (`git help gitattributes`, `git help gitignore` PATTERN FORMAT): `*` and `?`
+    never cross `/`; a pattern with no `/` (bar a trailing one) applies to the basename at any
+    depth, otherwise it is anchored to the root; leading `**/` is zero or more directories,
+    trailing `/**` is everything inside, `/**/` is zero or more directories; a trailing `/` means
+    directories only, which no file is, so it never matches; `\\` escapes the next character.
     """
-    m = tree.glob_matches
+    got = _GIT_PATTERN_RE.get(pat)
+    if got is not None:
+        return got
+    if pat.endswith("/") and not pat.endswith("\\/"):
+        got = (_NEVER, _NEVER)
+        _GIT_PATTERN_RE[pat] = got
+        return got
+    body = pat[1:] if pat.startswith("/") else pat
+    anchored = pat.startswith("/") or "/" in pat
+    out = []
+    i, n = 0, len(body)
+    if body.startswith("**/"):
+        out.append("(?:.*/)?")
+        i = 3
+        anchored = True
+    elif not anchored:
+        out.append("(?:.*/)?")
+    while i < n:
+        c = body[i]
+        if body.startswith("/**/", i):
+            out.append("/(?:.*/)?")
+            i += 4
+        elif body[i:] == "/**":
+            out.append("/.+")
+            i = n
+        elif c == "*":
+            while i < n and body[i] == "*":
+                i += 1
+            out.append("[^/]*")
+        elif c == "?":
+            out.append("[^/]")
+            i += 1
+        elif c == "\\":
+            if i + 1 < n:
+                out.append(re.escape(body[i + 1]))
+                i += 2
+            else:
+                out.append(re.escape("\\"))
+                i += 1
+        elif c == "[":
+            j = i + 1
+            neg = j < n and body[j] in "!^"
+            if neg:
+                j += 1
+            k = j
+            if k < n and body[k] == "]":
+                k += 1
+            while k < n and body[k] != "]":
+                k += 2 if body[k] == "\\" else 1
+            if k >= n:
+                out.append(re.escape(c))
+                i += 1
+                continue
+            cls, m = [], j
+            while m < k:
+                if body[m] == "\\" and m + 1 < k:
+                    cls.append(re.escape(body[m + 1]))
+                    m += 2
+                    continue
+                cls.append("\\" + body[m] if body[m] in "[&~|^\\" else body[m])
+                m += 1
+            inner = "".join(cls)
+            out.append(f"[^/{inner}]" if neg else f"(?!/)[{inner}]")
+            i = k + 1
+        else:
+            out.append(re.escape(c))
+            i += 1
+    text = "".join(out)
+    try:
+        got = (re.compile(text, re.DOTALL), re.compile(text, re.DOTALL | re.IGNORECASE))
+    except re.error:
+        got = (_NEVER, _NEVER)
+    _GIT_PATTERN_RE[pat] = got
+    return got
+
+
+def _is_generated(rel, pats, fold=False):
+    """`rel` against gitattributes patterns, following git's wildmatch rules: `*` stays inside one
+    directory, `**/` and `/**/` cross any number of them (zero included), and a pattern with no
+    slash in it applies at every level.
+
+    `fold` is git's `core.ignorecase`, passed in by the caller that knows the root. Case is matched
+    exactly first; folding is consulted only when a case-insensitive match would succeed, and `fold`
+    may be a callable (see `tree.glob_matches` for the measurement behind that).
+    """
+    # 🐛 [2026-09-29] (R158 acc4, 2026-09-29) This matched with fnmatch via `tree.glob_matches`,
+    # whose `*` crosses `/` and which has no zero-directory rule. A differential test against
+    # `git check-attr linguist-generated` (14 patterns, 23 files) found four disagreements:
+    #   `docs/*.md`          vs `docs/sub/a.md`   ours True,  git False (a real file left unindexed)
+    #   `a/**/b.py`          vs `a/b.py`          ours False, git True
+    #   `src/**/*.gen.ts`    vs `src/j.gen.ts`    ours False, git True
+    #   `\!bang.py`          vs `!bang.py`        ours False, git True
     for pat in pats:
-        bare = pat[3:] if pat.startswith("**/") else pat
-        if m(rel, pat, fold) or m(rel, bare, fold) or m("/" + rel, pat, fold):
+        cs, ci = _git_pattern_regex(pat)
+        if cs.fullmatch(rel):
             return True
-        if "/" not in bare and m(rel.rsplit("/", 1)[-1], bare, fold):
+        if ci.fullmatch(rel) and bool(fold() if callable(fold) else fold):
             return True
     return False
 
@@ -700,9 +801,12 @@ def _looks_built(path, source):
     return bool(SOURCEMAP_REF.search("\n".join(lines[-2:])))
 
 
+# 🐛 [2026-09-29] (R113 acc2, 2026-09-29) Two real generator headers were missed: the spaced form
+# `// THIS FILE IS AUTO GENERATED, DO NOT MODIFY` and `// This file is machine-generated - edits
+# will be lost`. `auto\s+generated` and `machine[\s-]generated` now match as well.
 GENERATED_MARKER = re.compile(
     r"(?:code\s+generated\s+by|generated\s+by\s+\S|do\s+not\s+edit|@generated|autogenerated"
-    r"|auto-generated|this\s+file\s+is\s+generated)", re.I)
+    r"|auto-generated|auto\s+generated|machine[\s-]generated|this\s+file\s+is\s+generated)", re.I)
 
 BOILERPLATE_WINDOW = 240
 # 🐛 A comment that labels the import block is not a description of the file, and letting one
@@ -1047,6 +1151,11 @@ def _parse_py(source, path):
     key, cached = _PARSE_MEMO
     if key is source:
         return cached
+    n_fstrings = len(_FSTRING_OPEN.findall(source))
+    if n_fstrings > MAX_FSTRINGS:
+        result = (None, [], f"{n_fstrings} f-strings exceeds the limit of {MAX_FSTRINGS}: f-strings parse in quadratic time on Python 3.12+")
+        _PARSE_MEMO = (source, result)
+        return result
     try:
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
@@ -1621,6 +1730,9 @@ def _dot_m_is_objective_c(path):
     return not _MATLAB_MARK.search(head)
 
 
+_ENV_ASSIGN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+
+
 def _lang_from_shebang(path):
     """The language of an extensionless executable, from its first line, or None.
 
@@ -1629,7 +1741,9 @@ def _lang_from_shebang(path):
     """
     try:
         with path.open("rb") as fh:
-            first = fh.read(200).split(b"\n", 1)[0]
+            # 🐛 [2026-09-30] (self-measured) Windows CI -- a CRLF first line kept its `\r`, so
+            # every shebang there lost its language.
+            first = fh.read(200).split(b"\n", 1)[0].rstrip(b"\r")
     except OSError:
         return None
     if not first.startswith(b"#!"):
@@ -1638,10 +1752,30 @@ def _lang_from_shebang(path):
     # `#!/usr/bin/env python3` and `#!/bin/bash` both end in the interpreter; `env` is skipped
     # because it is the launcher, not the language.
     words = [w for w in line[2:].replace("\t", " ").split(" ") if w]
+    # 🐛 [2026-09-29] (R103 acc4, 2026-09-29) Only `env` and `-S` were skipped, so an `env` that
+    # carried its own options read one of them as the interpreter and the file lost its language:
+    # `#!/usr/bin/env -S PYTHONPATH=lib python3`, `#!/usr/bin/env -iS python3`,
+    # `#!/usr/bin/env -u HOME python3` and `#!/usr/bin/env PYTHONDONTWRITEBYTECODE=1 python3` all
+    # gave None. Once `env` has been seen, every option and NAME=VALUE word is skipped, and the
+    # options that take a separate argument skip that argument too.
+    seen_env = False
+    skip_next = False
     for word in words:
-        name = word.rsplit("/", 1)[-1]
-        if name in ("env", "-S"):
+        if skip_next:
+            skip_next = False
             continue
+        name = word.rsplit("/", 1)[-1]
+        if name == "env":
+            seen_env = True
+            continue
+        if name == "-S":
+            continue
+        if seen_env:
+            if word in ("-u", "-C", "-P", "--unset", "--chdir"):
+                skip_next = True
+                continue
+            if word.startswith("-") or _ENV_ASSIGN.match(word):
+                continue
         # `python3.12` -> `python3`; a trailing minor version is not a different language.
         base = name.split(".")[0]
         if base in _SHEBANG_LANG:
