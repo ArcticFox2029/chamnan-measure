@@ -1367,7 +1367,26 @@ def is_never_opened(path):
     and the comment written to stop it happening again was attached to the function that was
     already right.
     """
-    return any(_is_never_opened_name(n) for n in _names_to_judge(path))
+    return (any(_is_never_opened_name(n) or _is_credential_file_name(n) for n in _names_to_judge(path))
+            or (path.name == "config" and path.parent.name == ".kube"))
+
+
+# 🐛 [2026-10-06] (owner's decision, R247 / R15 acc1 / R121 acc1) `credentials.json` was refused unread
+# while a real `.env`, a Google `client_secret_*.json` and a kubeconfig were opened and summarised --
+# files whose whole content is the secret. The templates people commit on purpose stay readable.
+# Only the commands that print a file use this list: the env catalog still reads `.env` through
+# is_blocked for variable NAMES and its not-gitignored warning, and captures no value. Check 440.
+_ENV_TEMPLATES = ("example", "sample", "template", "dist", "defaults", "schema")
+
+
+def _is_credential_file_name(name):
+    if name == ".env" or (name.startswith(".env.") and name.split(".")[-1] not in _ENV_TEMPLATES):
+        return True
+    if name.endswith(".env") and name[:-4].rsplit(".", 1)[-1] not in _ENV_TEMPLATES:
+        return True
+    if name.startswith("client_secret") and name.endswith(".json"):
+        return True
+    return name == "kubeconfig" or name.endswith(".kubeconfig")
 
 
 def _is_never_opened_name(name):
@@ -2361,6 +2380,35 @@ _STEM_MARGIN = 64
 _LAST_STEM_HITS = (None, None)
 
 
+def _may_name_a_secret(text):
+    """False only when `text` holds no SECRET_WORDS stem, so no rule built on SECRET_WORDS can match.
+
+    🎯 [2026-10-06] (R1 acc4, R11 acc4, 2026-10-06) Four such rules ran over every text, and compiling
+    them is 48 of the 54 ms a first scrub costs -- paid by the file pointer on a line that names no
+    secret word at all. The stem filter is derived from SECRET_WORDS and held equal to it by check
+    121, so "no stem" means "no match" for every rule that embeds it. When the filter cannot be
+    built the answer is True: scan as before. Check 443.
+    """
+    global _STEM_FILTER, _LAST_GATE
+    # The answer for an unchanged text is the answer it had: on a 590 KB map every call says True
+    # and each one folded the whole text again (28 ms, three times a scrub). The stem hits, when
+    # already computed for this text, answer it outright.
+    if _LAST_STEM_HITS[0] is not None and text == _LAST_STEM_HITS[0]:
+        return bool(_LAST_STEM_HITS[1])
+    if _LAST_GATE[0] is not None and text == _LAST_GATE[0]:
+        return _LAST_GATE[1]
+    if _STEM_FILTER is _UNBUILT:
+        _STEM_FILTER = _make_stem_filter()
+    if _STEM_FILTER is None:
+        return True
+    answer = _STEM_FILTER.search(text.translate(_STEM_FOLD).lower()) is not None
+    _LAST_GATE = (text, answer)
+    return answer
+
+
+_LAST_GATE = (None, None)
+
+
 def _secret_word_hits(text):
     """Every `_SECRET_WORD_ANYWHERE` match in `text`, in order -- coarse-to-fine where possible.
 
@@ -3164,6 +3212,8 @@ def scrub(text, windowed=True, *, _unmask=True):
             _with = scrub(_joined, windowed, _unmask=False)
             _without = scrub(text, windowed, _unmask=False)
             return _with if _with.count(PLACEHOLDER) > _without.count(PLACEHOLDER) else _without
+    text = _redact_yaml_anchor_targets(text)
+    text = _redact_secret_sections(text)
     text = _redact_kubernetes_secret_data(text)
     for pattern in PATTERNS + [DELIMITED_AFTER_SECRET_WORD] + LATE_PREFIXES:
         # A pattern with one group keeps everything outside it: "Bearer <REDACTED>" stays readable
@@ -3171,6 +3221,8 @@ def scrub(text, windowed=True, *, _unmask=True):
         # Two groups, and only the value goes — the sentence has to stay readable or the reader
         # cannot tell what was removed. Same shape as AUTH_SCHEME_SECRET below, one rule further on.
         if pattern is DELIMITED_AFTER_SECRET_WORD:
+            if not _may_name_a_secret(text):
+                continue
             text = pattern.sub(
                 lambda m: m.group(0)
                 if not _prose_gap(m.group("gap")) or not _reads_like_a_credential(m.group("value"))
@@ -3197,9 +3249,10 @@ def scrub(text, windowed=True, *, _unmask=True):
         else f"{m.group(1)}:{PLACEHOLDER}@", text)
     # Before the assignment rules: these forms carry no `[:=]` the assignment rules can anchor on,
     # and running them first means a value they take is not left for a looser rule to half-capture.
-    text = XML_SECRET.sub(
-        lambda m: m.group(0) if _names_a_mechanism(m.group(1), m.group(2))
-        else f"{m.group(1)}{PLACEHOLDER}{m.group(3)}", text)
+    if _may_name_a_secret(text):
+        text = XML_SECRET.sub(
+            lambda m: m.group(0) if _names_a_mechanism(m.group(1), m.group(2))
+            else f"{m.group(1)}{PLACEHOLDER}{m.group(3)}", text)
     # 🐛 [2026-09-28] (R214 acc4, 2026-09-27) The name/value SIBLING-FIELD shape: the credential word
     # lives in a `name=`/`key=`/`id=` attribute, or a JSON `"name"`/`"key"` member, and the actual
     # secret sits in a separate `value=` attribute or `"value"` member beside it. Same guard as
@@ -3370,6 +3423,8 @@ def scrub(text, windowed=True, *, _unmask=True):
     text = _redact_secret_lists(text)
     text = _redact_command_credentials(text)
     text = _redact_key_encodings(text)
+    text = _redact_kubeconfig_users(text)
+    text = _redact_api_client_auth(text)
     text = _redact_delimited_columns(text)
     # The personal-data layer, after the credential rules: a card number inside a connection string
     # has already gone, and what is left for this to find is a bare number in prose or a fixture.
@@ -4043,7 +4098,13 @@ def _is_a_header_row(fields):
 # position -- walk to the end of any dotted run and back: 40,000 characters of `a.a.a…` took 205 s,
 # quadratic. Four segments of up to 32 characters cover every header name in real use
 # (`x-amz-security-token` is three) and keep each position's work constant.
-_NAME_PREFIX = r"(?:[A-Za-z0-9]{1,32}[-_.]){0,4}"
+# 🐛 [2026-10-06] (R83 acc5, 2026-10-06) Only SEPARATED segments were allowed, so a camelCase or
+# PascalCase name -- `adminPassword`, `sqlAdminPassword`, `DBPassword`, how an Azure parameters file
+# names every input -- never matched and its `{"value": ...}` printed in full. Up to four humps may
+# now come before the secret word, case-sensitively, so the word must START a hump: `bypass` is not
+# `pass`. Each hump's lowercase run is maximal, so this adds no backtracking. Check 449.
+_NAME_PREFIX = (r"(?:[A-Za-z0-9]{1,32}[-_.]){0,4}"
+                r"(?-i:[A-Za-z][a-z0-9]{0,31}(?:[A-Z][a-z0-9]{0,31}){0,3}(?=[A-Z]))?")
 _LIST_OPEN = _lazy(lambda: re.compile(
     r"(?<![\w-])(['\"]?)(" + _NAME_PREFIX + r"(?:" + SECRET_WORDS + r")" + _KEY_RUN + r")\1(\s*" + _KV_SEP + r"\s*)\[([^\[\]]*)\]", re.I))
 # A YAML block sequence: the key alone on its line, then indented `- item` lines under it.
@@ -4128,6 +4189,168 @@ _JWK_OBJECT = _lazy(lambda: re.compile(r"\{[^{}]*\"kty\"[^{}]*\}"))
 _JWK_PRIVATE = _lazy(lambda: re.compile(r"(\"(?:d|p|q|dp|dq|qi|k)\"\s*:\s*\")([A-Za-z0-9_\-+/=]{8,})(\")"))
 
 
+# A kubeconfig keeps a user's credential under `users:` -> `user:`, and a bearer `token:` there is a
+# random string no shape rule can recognise; `client-key-data` is a private key in base64. Judged
+# only inside a top-level `users:` block, so a `token:` anywhere else (pagination, CSRF settings)
+# is left alone. Check 440.
+_KUBE_USER_SECRET = _lazy(lambda: re.compile(
+    r"^(\s+-?\s*(?:token|client-key-data|id-token|refresh-token|password)\s*:\s*)(['\"]?)([^\s'\"$][^\s'\"]*)\2\s*$"))
+
+
+def _redact_kubeconfig_users(text):
+    """Redact the credential fields of a kubeconfig's `users:` entries."""
+    if "users:" not in text or "user:" not in text:
+        return text
+    lines = text.split("\n")
+    inside = False
+    for i, line in enumerate(lines):
+        if line.rstrip() == "users:":
+            inside = True
+            continue
+        if inside and line[:1] and not line[:1].isspace() and not line.startswith("-"):
+            inside = False
+        if inside:
+            m = _KUBE_USER_SECRET.match(line)
+            if m:
+                lines[i] = f"{m.group(1)}{m.group(2)}{PLACEHOLDER}{m.group(2)}"
+    return "\n".join(lines)
+
+
+# 🐛 [2026-10-06] (R97 acc4, 2026-10-06) An API client stores its auth under generic names: Postman as
+# `"bearer": [{"key": "token", "value": "..."}]` or `"apikey": [{"key": "value", "value": "..."}]`,
+# Bruno -- whose `.bru` files are made to be committed -- as `token:` or `value:` inside an
+# `auth:bearer {` / `auth:apikey {` block. A bare `token` or `value` names nothing, so each printed
+# in full. Only inside an auth block of a named type are they the credential; a `{{variable}}` or a
+# `$` reference is left, as is the `key` member of an API key (it is the header name). Check 450.
+_AUTH_TYPES = r"(?:bearer|apikey|oauth1|oauth2|jwt|basic|digest|hawk|awsv4|ntlm|wsse|akamai|edgegrid|asap)"
+_POSTMAN_AUTH = _lazy(lambda: re.compile(r'"' + _AUTH_TYPES + r'"\s*:\s*\[[^\[\]]*\]', re.I))
+_POSTMAN_AUTH_PAIR = _lazy(lambda: re.compile(
+    r'("key"\s*:\s*"(?:token|value)"\s*,\s*"value"\s*:\s*")((?:[^"\\\n]|\\.)+)"'))
+_BRUNO_AUTH_OPEN = _lazy(lambda: re.compile(r"^auth:" + _AUTH_TYPES + r"\s*\{\s*$", re.I))
+_BRUNO_AUTH_FIELD = _lazy(lambda: re.compile(r"^(\s*(?:token|value)\s*:[ \t]*)(\S.*?)\s*$"))
+
+
+def _is_a_client_reference(value):
+    return value.startswith(("{{", "$"))
+
+
+def _redact_api_client_auth(text):
+    """Redact the token or key an API client's auth block keeps under a generic member name."""
+    if '"key"' in text:
+        text = _POSTMAN_AUTH.sub(lambda b: _POSTMAN_AUTH_PAIR.sub(
+            lambda m: m.group(0) if _is_a_client_reference(m.group(2))
+            else f'{m.group(1)}{PLACEHOLDER}"', b.group(0)), text)
+    if "auth:" not in text:
+        return text
+    lines = text.split("\n")
+    inside = False
+    for i, line in enumerate(lines):
+        if _BRUNO_AUTH_OPEN.match(line):
+            inside = True
+            continue
+        if inside and line.strip() == "}":
+            inside = False
+        if inside:
+            m = _BRUNO_AUTH_FIELD.match(line)
+            if m and not _is_a_client_reference(m.group(2)):
+                lines[i] = m.group(1) + PLACEHOLDER
+    return "\n".join(lines)
+
+# 🐛 [2026-10-06] (R57 acc5, 2026-10-06) Compose, GitHub Actions and GitLab CI expand YAML anchors, so
+# `x-defaults: &dbcred <value>` used as `DB_PASSWORD: *dbcred`, or as a `- *tok` item under `secrets:`,
+# IS the password -- and every name rule judged lines one at a time: the alias (a reference) was
+# replaced and the value at the anchor printed. An anchor whose alias sits under a secret-named key
+# has its scalar redacted where it is defined. A key naming a mechanism (`password_file`) does not
+# count. Check 446.
+_YAML_ALIAS_VALUE = _lazy(lambda: re.compile(r"^(\s*)(?:-\s+)?([^\s:#][^:#]*?)?\s*:?\s*\*([A-Za-z0-9_.-]+)\s*$"))
+_YAML_KEY_LINE = _lazy(lambda: re.compile(r"^(\s*)([^\s:#-][^:#]*?)\s*:\s*$"))
+_YAML_ANCHOR_SCALAR = _lazy(lambda: re.compile(r"(&([A-Za-z0-9_.-]+)\s+)(['\"]?)([^\s'\"#{}\[\]][^'\"#\n]*?)\3(\s*(?:#.*)?)$"))
+
+
+def _secret_named_yaml_key(key):
+    key = key.strip().strip("'\"")
+    return bool(key) and bool(_secret_word_hits(key)) and not _names_a_mechanism(key)
+
+
+def _redact_yaml_anchor_targets(text):
+    """Redact the scalar at an anchor whose alias a secret-named key reaches."""
+    if "&" not in text or "*" not in text:
+        return text
+    lines = text.split("\n")
+    wanted = set()
+    for i, line in enumerate(lines):
+        m = _YAML_ALIAS_VALUE.match(line)
+        if not m:
+            continue
+        key = m.group(2) if m.group(2) and not line.lstrip().startswith("-") else None
+        if key is None:
+            # A `- *name` item belongs to the nearest less-indented `key:` above it.
+            indent = len(m.group(1))
+            for j in range(i - 1, -1, -1):
+                k = _YAML_KEY_LINE.match(lines[j])
+                if k and len(k.group(1)) < indent + 1:
+                    key = k.group(2)
+                    break
+                if lines[j].strip() and len(lines[j]) - len(lines[j].lstrip()) < indent and not k:
+                    break
+        if key and _secret_named_yaml_key(key):
+            wanted.add(m.group(3))
+    if not wanted:
+        return text
+    for i, line in enumerate(lines):
+        m = _YAML_ANCHOR_SCALAR.search(line)
+        if m and m.group(2) in wanted:
+            lines[i] = line[:m.start(4)] + PLACEHOLDER + line[m.end(4):]
+    return "\n".join(lines)
+
+
+# 🐛 [2026-10-06] (R68 acc5, 2026-10-06) In TOML and INI the meaning often sits in the section header,
+# not the key: `[secrets]` then `prod = <value>`. Every name rule reads one line, so those values
+# printed in full, as did a password in a TOML multi-line string. Under a header that names a secret
+# (SECRET_WORDS, plus a bare `token`/`tokens`; never `keys`, which is keybindings), a value that
+# reads like a credential is redacted unless its key names a mechanism. Check 448.
+_INI_HEADER = _lazy(lambda: re.compile(r"^\s*\[\[?\s*([^\[\]]+?)\s*\]\]?\s*(?:[#;].*)?$"))
+_INI_ASSIGN = _lazy(lambda: re.compile(
+    r"^(\s*([A-Za-z0-9_.\-\"']+)\s*[=:]\s*)(['\"]?)([^'\"\s#;][^'\"#;]*?)\3(\s*(?:[#;].*)?)$"))
+_MULTILINE_OPEN = _lazy(lambda: re.compile(r"^\s*([A-Za-z0-9_.\-\"']+)\s*=\s*(\"\"\"|''')\s*$"))
+
+
+def _header_names_a_secret(header):
+    last = header.strip().strip("'\"").rsplit(".", 1)[-1].lower()
+    return last in ("token", "tokens") or bool(_secret_word_hits(header))
+
+
+def _redact_secret_sections(text):
+    """Credential-shaped values under a secret-named TOML/INI header, and secret multi-line strings."""
+    if "[" not in text and '"""' not in text and "'''" not in text:
+        return text
+    lines = text.split("\n")
+    in_secret = False
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        h = _INI_HEADER.match(line)
+        if h:
+            in_secret = _header_names_a_secret(h.group(1))
+            i += 1
+            continue
+        ml = _MULTILINE_OPEN.match(line)
+        if ml and (_secret_named_yaml_key(ml.group(1)) or in_secret):
+            close, j = ml.group(2), i + 1
+            while j < len(lines) and close not in lines[j]:
+                if lines[j].strip():
+                    lines[j] = PLACEHOLDER
+                j += 1
+            i = j + 1
+            continue
+        if in_secret:
+            a = _INI_ASSIGN.match(line)
+            if a and not _names_a_mechanism(a.group(2).strip("'\"")) and _reads_like_a_credential(a.group(4)):
+                lines[i] = a.group(1) + a.group(3) + PLACEHOLDER + a.group(3) + a.group(5)
+        i += 1
+    return "\n".join(lines)
+
+
 def _redact_key_encodings(text):
     """Redact the private part of a PuTTY key file and of a JSON Web Key."""
     if "Private-Lines:" in text:
@@ -4153,9 +4376,12 @@ def _redact_secret_lists(text):
         return (f"{m.group(1)}{m.group(2)}{m.group(1)}{m.group(3)}"
                 f"[{','.join(_list_element(x) for x in m.group(4).split(','))}]")
 
+    if not _may_name_a_secret(text):
+        return text
     text = _LIST_OPEN.sub(_inline, text)
     # Only text that has a `"value"` member pays for compiling the pattern.
-    if '"value"' in text:
+    # Any casing: a .NET appsettings file writes `"Value"`. Check 449.
+    if '"value"' in text or '"Value"' in text or '"VALUE"' in text:
         text = _OBJECT_VALUE.sub(lambda m: f"{m.group(1)}{m.group(2)}{m.group(1)}{m.group(3)}"
                                  f"{PLACEHOLDER}\"", text)
     # 🐛 [2026-09-08] This used `splitlines()`, which breaks on eight characters besides `\n`:
