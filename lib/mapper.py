@@ -28,7 +28,10 @@ output above, and running it prints the same thing plain `chamnan-map` does.
 Never imports or executes the code it reads.
 """
 import ast
+import codecs
 import fnmatch
+import hashlib
+import json
 import os
 import subprocess
 import warnings
@@ -169,6 +172,60 @@ def _top_level(path, root):
 _TRACKED_AMBIGUOUS = {}
 _GENERATED_GLOBS = {}
 SKIPPED_GENERATED = set()
+SKIPPED_AI_IGNORED = set()
+_AI_IGNORE_FILES = (".aiignore", ".cursorignore", ".codeiumignore", ".aiexclude")
+_AI_IGNORE_PATTERNS = {}
+
+
+# 🐛 [2026-10-01] (R411 acc4, 2026-10-01) Reproduced: a fixture whose root `.aiignore` named
+# `secret_pricing.py` (first comment "Pricing formula for enterprise deals, confidential") got that
+# summary into `.chamnan/MAP.md`, which is injected into every session. Users keep these files so AI
+# tools stay away from a path, and chamnan read none of them. Four names, gitignore syntax, at the
+# repository root only: `.aiignore`, `.cursorignore`, `.codeiumignore`, `.aiexclude`.
+def _ai_ignore_patterns(root):
+    """`(negated, pattern)` pairs from the AI-exclusion files at `root`, in file order."""
+    key = str(root)
+    if key in _AI_IGNORE_PATTERNS:
+        return _AI_IGNORE_PATTERNS[key]
+    pats = []
+    for name in _AI_IGNORE_FILES:
+        f = Path(root) / name
+        if not f.is_file():
+            continue
+        try:
+            text = tree.read_capped(f)
+        except OSError:
+            continue
+        for line in text.splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            negated = line.startswith("!")
+            pats.append((negated, line[1:] if negated else line))
+    _AI_IGNORE_PATTERNS[key] = pats
+    return pats
+
+
+def _is_ai_ignored(rel, pats, fold=False):
+    """Last matching pattern decides; a negation cannot re-include under an excluded directory.
+
+    Mirrors `catalogs._ignored_by_files`: a pattern matches the path itself or any ancestor
+    directory, and git cannot re-include a file whose parent directory is excluded.
+    """
+    _fold = lambda: fold() if callable(fold) else fold          # noqa: E731
+    parts = rel.split("/")[:-1]
+    ancestors = ["/".join(parts[:i]) for i in range(1, len(parts) + 1)]
+    verdict = False
+    parent_excluded = False
+    for negated, pat in pats:
+        if not tree.gitignore_matches(rel, pat, _fold()):
+            continue
+        if negated and parent_excluded:
+            continue
+        verdict = not negated
+        if not negated and any(tree.gitignore_matches(a, pat, _fold()) for a in ancestors):
+            parent_excluded = True
+    return verdict
 
 
 def _generated_globs(root):
@@ -908,6 +965,47 @@ def _skip_continuation(lines, i):
     return i
 
 
+def _block_lines(lines, start, end, prefix):
+    """The comment block in `lines[start:end]` as stripped, non-empty lines (markers removed)."""
+    out = []
+    opener = BLOCK_OPEN.match(lines[start])
+    for n in range(start, end):
+        line = lines[n]
+        if n == start and opener:
+            line = line[opener.end():]
+        elif opener:
+            line = prefix.sub("", line)
+        else:
+            line = prefix.sub("", line)
+        if opener:
+            line = line.split(BLOCK_CLOSE)[0]
+        if line.strip():
+            out.append(line.strip())
+    return out
+
+
+def _after_licence_lines(parts):
+    """The description left in a comment block once its leading licence lines are dropped, or ""."""
+    # 🐛 [2026-09-30] (R201 acc4, 2026-09-30) A licence/copyright/SPDX line and the real description
+    # often share ONE comment block with no blank line between them. The whole block matched
+    # BOILERPLATE and was rejected, the next block was code, and the file got no summary at all.
+    # Leading boilerplate lines are dropped here and the rest is accepted -- but only when the WHOLE
+    # remainder is free of boilerplate, not just its first window: a multi-line Apache or MIT notice
+    # would otherwise yield a clause of its own body ("Unless required by applicable law ...") whose
+    # first line looks clean and whose following line ("... under the License ...") does not.
+    k = 0
+    while k < len(parts) and BOILERPLATE.search(parts[k]):
+        k += 1
+    if k == 0 or k >= len(parts):
+        return ""
+    rest = " ".join(parts[k:]).strip()
+    bare = ANY_DOC_TAG_TAIL.sub("", rest).strip()
+    if not rest or BOILERPLATE.search(rest) or IMPORT_LABEL.match(bare) \
+            or XCODE_ATTRIBUTION.search(rest):
+        return ""
+    return rest
+
+
 def leading_comment(source, lang=None):
     """The file's opening comment, used as its one-line summary.
 
@@ -937,6 +1035,7 @@ def leading_comment(source, lang=None):
             return _clip(MAGIC_COMMENT.sub("", joined, count=1).strip())
 
     i = 0
+    fallback = ""
     for _ in range(6):          # at most six boilerplate blocks before giving up on the file
         while i < len(lines):
             line = lines[i]
@@ -951,10 +1050,11 @@ def leading_comment(source, lang=None):
                 continue
             break
         if i >= len(lines):
-            return ""
+            return _clip(fallback) if fallback else ""
+        start = i
         text, i = _one_comment(lines, i, prefix)
         if not text:
-            return ""
+            return _clip(fallback) if fallback else ""
         parts = [x for x in text.split("  ") if x.strip()]
         text = " ".join(parts).strip()
         # Strip an opening "SomeFile.swift" line before judging: a header that names the file and
@@ -991,7 +1091,10 @@ def leading_comment(source, lang=None):
                 and not IMPORT_LABEL.match(bare) \
                 and not XCODE_ATTRIBUTION.search(text[:BOILERPLATE_WINDOW]):
             return _clip(text)
-    return ""
+        if text and not fallback:
+            # Only a fallback: a later block's accepted description always wins over it.
+            fallback = _after_licence_lines(_block_lines(lines, start, i, prefix))
+    return _clip(fallback) if fallback else ""
 
 
 # A Homebrew formula states its own one-line summary in `desc "..."`. That is not a comment, so the
@@ -1262,6 +1365,14 @@ def extract_python(source, path, lang='py'):
 # Each entry is (kind, pattern). Patterns are anchored at line start so a match is a top-level
 # declaration rather than something nested inside a function body.
 REGEX_RULES = {
+    # Used only when `ast` cannot be used on a Python file (the f-string cap or a parse error), so
+    # the map still lists its top-level names. A regex cannot see decorators' effects or nested
+    # scopes, which is why it is a fallback and never the first choice.
+    "py": [
+        ("func", r"^(?:async\s+)?def\s+(\w+)\s*\(([^)]*)\)"),
+        ("class", r"^class\s+(\w+)"),
+        ("const", r"^([A-Z][A-Z0-9_]{2,})\s*(?::[^=\n]*)?=(?!=)"),
+    ],
     "js": [
         # 🐛 `export default function Foo()` was invisible while `export default class Foo`
         # was not: the class rule three lines down already carried `default` and the func rule
@@ -1623,13 +1734,33 @@ def _sfc_extraction_source(source, path):
     return source
 
 
+# First line of a module docstring, linear in the file size: skip leading blank and `#` lines
+# (shebang, encoding, licence), then take the first line of the opening triple-quoted string.
+_PY_MODULE_DOCSTRING = re.compile(
+    r'\A(?:[ \t]*(?:#[^\n]*)?\n)*[ \t]*[rRuU]?("""|\'\'\')[ \t]*\n?[ \t]*([^\n]*)')
+
+
 def _extract_one(source, path, lang):
     """Dispatch to the right extractor. Separated from scan() so the caller can wrap exactly this
     in one try and keep a bad file from taking the run down with it."""
     if lang == "py":
         parsed = extract_python(source, path)
         if parsed[0] is None and not parsed[1]:
-            return leading_comment(source, lang), [], [], []
+            # 🐛 [2026-10-01] (owner) The owner asked (2026-09-30) whether skipping the over-cap
+            # file was hiding the problem. It was: the file lost its docstring and every top-level
+            # name, for the f-string cap and for any file `ast` rejects. The linear regex extractor
+            # other languages use now recovers them, and the file is still recorded as unparsed.
+            m = _PY_MODULE_DOCSTRING.match(source)
+            doc = ""
+            if m and m.group(2) and not m.group(2).startswith(m.group(1)):
+                first = m.group(2).strip()
+                if first.endswith(m.group(1)):
+                    first = first[:-3].strip()
+                doc = _first_sentence(_clip(first))
+            if not doc:
+                doc = leading_comment(source, lang)
+            _, funcs, classes, consts = extract_regex(source, "py")
+            return doc, funcs, classes, consts
         return parsed
     return extract_regex(_sfc_extraction_source(source, path), lang)
 
@@ -1929,6 +2060,11 @@ def indexable(root, nested=None, with_text=False, sniff=True):
                                   lambda: tree.git_folds_case(root)):
             SKIPPED_GENERATED.add("/".join(rel_parts))
             continue
+        _ai = _ai_ignore_patterns(root)
+        if _ai and _is_ai_ignored("/".join(rel_parts), _ai,
+                                  lambda: tree.git_folds_case(root)):
+            SKIPPED_AI_IGNORED.add(str(path))
+            continue
         # 🐛 [2026-09-24] (self-measured) Found the first session after 1.31.1 was installed: the
         # dashboard is now built INTO the workspace, and the next index described its pages as the
         # repository's source. A path rule rather than a name in SKIP_DIRS, because `statistic/` is
@@ -2057,7 +2193,13 @@ def indexable(root, nested=None, with_text=False, sniff=True):
             if bom is None and b"\x00" in raw[:8192]:
                 SKIPPED_BINARY.append(path)
                 continue
-            text = raw.decode(bom or "utf-8-sig", errors="replace")
+            if bom:
+                text = raw.decode(bom, errors="replace")
+            else:
+                try:
+                    text = raw.decode("utf-8-sig")
+                except UnicodeDecodeError:
+                    text = raw.decode(_declared_encoding(raw) or "utf-8-sig", errors="replace")
             if "\r" in text:
                 text = text.replace("\r\n", "\n").replace("\r", "\n")
             yield path, lang, text
@@ -2080,6 +2222,23 @@ def indexable(root, nested=None, with_text=False, sniff=True):
             # 16-39 seconds per firing, against the docstring's own claim of "0.04s on a 1,478-file
             # repository". The caller re-checks the handful of files that are actually newer.
             yield path, lang
+
+
+def _declared_encoding(raw):
+    """The codec a PEP 263 / Emacs / Vim coding cookie in the first two lines names, or None.
+
+    # 🐛 [2026-10-01] (R275 acc2, 2026-10-01) Files declaring a legacy encoding (tis-620, latin-1,
+    # shift_jis) kept their symbols in MAP.md but lost their summary to "— —", because every file
+    # was decoded as UTF-8 with errors="replace" and the docstring became U+FFFD. Strict UTF-8 is
+    # tried FIRST by the caller, so a valid UTF-8 file never reaches this and decodes as before."""
+    for line in raw.split(b"\n")[:2]:
+        m = re.search(r"coding[:=]\s*([-\w.]+)", line.decode("latin-1"))
+        if m:
+            try:
+                return codecs.lookup(m.group(1)).name
+            except LookupError:
+                return None
+    return None
 
 
 def _bom_encoding(raw):
@@ -2116,6 +2275,7 @@ def reset_skips():
     SKIPPED_UNPARSEABLE.clear()
     SKIPPED_BUILD_DIR.clear()
     SKIPPED_GENERATED.clear()
+    SKIPPED_AI_IGNORED.clear()
     SKIPPED_UNKNOWN_EXT.clear()
     SKIPPED_UNKNOWN_DIR.clear()
     PARSE_WARNINGS.clear()
@@ -2287,6 +2447,9 @@ def _what_this_index_leaves_out(root):
         out.append(f"**{len(SKIPPED_TOO_LARGE)} file(s) are too large to index** — "
                    f"{_named([p for p, _ in SKIPPED_TOO_LARGE])}. "
                    f"`chamnan-peek <path>` reads the shape of one without loading it.")
+    if SKIPPED_AI_IGNORED:
+        out.append(f"**{len(SKIPPED_AI_IGNORED)} file(s) are left out because an AI-ignore file "
+                   f"names them** — their names are not shown either.")
     if SKIPPED_TOO_MANY_LINES:
         out.append(f"**{len(SKIPPED_TOO_MANY_LINES)} file(s) have too many lines to index** — "
                    f"{_named([p for p, _ in SKIPPED_TOO_MANY_LINES])}.")
@@ -2357,6 +2520,53 @@ def _built_by():
     return f" Built by chamnan {v}." if v else ""
 
 
+def scrub_map_text(text, root):
+    """🎯 [2026-10-05] (R91 acc5, 2026-10-05) Scrub `text` section by section, reusing a cache.
+
+    The whole-text scrub cost 5.8-7.0 s of the 11.2 s map refresh (R172). Content-defined chunking
+    reuses every chunk an edit did not touch; MAP.md's `## ` sections are its natural content
+    boundaries (896 on the Lumin-App workspace, median 217 characters); scrubbing them one by one
+    was byte-equal to the whole-text scrub on the real 583,753-character file. A section boundary
+    is a generated heading line, so no credential can span it. The cache lives in logs/ because it
+    is derived, rebuilt on any miss, and must never be committed. Check 423.
+    """
+    parts = re.split(r"(?=\n## )", text)
+    wsdir = ws.workspace(root)
+    if not Path(wsdir).is_dir():
+        return "".join(redact.scrub(p) for p in parts)
+    import recall  # lazy: only a workspace has a cache, and recall's fingerprint is the one key
+    ident = recall.scrubber_id()
+    if ident == "unknown":
+        return "".join(redact.scrub(p) for p in parts)
+    path = Path(wsdir) / "logs" / "map_scrub_cache.json"
+    old = {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8-sig"))
+        if (isinstance(data, dict) and data.get("scrubber") == ident
+                and isinstance(data.get("parts"), dict)):
+            old = data["parts"]
+    except (OSError, ValueError, RecursionError):
+        old = {}
+    fresh = {}
+    out = []
+    for p in parts:
+        key = hashlib.sha1(p.encode("utf-8")).hexdigest()
+        got = old.get(key)
+        if not isinstance(got, str):
+            got = redact.scrub(p)
+        fresh[key] = got
+        out.append(got)
+    # `--preview` and CHAMNAN_READ_ONLY promise no writes; the cache is skipped, not the scrub.
+    if not ws.read_only():
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            return "".join(out)  # no logs/ to write into: the scrub is done, only the reuse is lost
+        # Returns False rather than raising; a failed write only costs a full scrub next time.
+        ws.atomic_write_text(path, json.dumps({"scrubber": ident, "parts": fresh}))
+    return "".join(out)
+
+
 def _render(files, root):
     total_chars = sum(f["chars"] for f in files)
     lines = [
@@ -2422,7 +2632,7 @@ def _render(files, root):
         if here != cur_dir:
             cur_dir = here
             lines.append("")
-            lines.append(f"**`{mdblock.as_quoted(here if here != '.' else '.')}/`**")
+            lines.append(f"**`{mdblock.as_quoted(here if here != '.' else '.', mdblock.QUICK_INDEX_DIR_CHARS)}/`**")
         shown = PurePosixPath(f["path"]).name
         lines.append(f"- **`{mdblock.as_quoted(shown)}`**"
                      f" ({f['lines']}L{', ' + '/'.join(counts) if counts else ''}) — {mdblock.one_line(summary)}")
@@ -2441,7 +2651,9 @@ def _render(files, root):
     stored = assets_mod.scan(root,
                              {f["path"] for f in files} | deployed.get("claimed", set()),
                              EXT_LANG)
-    for section_text in (schema_mod.render(tables),
+    commands = catalogs_mod.scan_commands(root)
+    for section_text in (catalogs_mod.render_commands(commands),
+                         schema_mod.render(tables),
                          catalogs_mod.render_routes(routes),
                          catalogs_mod.render_env(env_pairs, env_unsafe),
                          deploy_mod.render(deployed),
@@ -2530,4 +2742,4 @@ def _render(files, root):
     # emoji in comments — it changes **0 of 392,293 characters**. What it would change is what
     # nobody wrote on purpose. ZWJ, ZWNJ and the bidi MARKS are deliberately not in that table; see
     # `redact._TERMINAL_SAFE`, which argues that case at length and is right.
-    return redact.for_a_terminal(redact.scrub(text))
+    return redact.for_a_terminal(scrub_map_text(text, root))

@@ -103,7 +103,21 @@ def _quiet_broken_pipe(kind, value, tb, _previous=sys.excepthook):
     if isinstance(kind, type) and issubclass(kind, WorkingDirectoryGone):
         print("chamnan: %s" % (value,), file=sys.stderr)
         sys.exit(1)
-    _previous(kind, value, tb)
+    # 🐛 [2026-10-01] (R380 acc4, 2026-10-01) Python's default hook prints the exception MESSAGE
+    # raw, and stderr of a command run through a tool call goes into the model's context and the
+    # transcript. Measured: `import workspace; raise ValueError('config value <ghp_ token> is not
+    # valid')` printed the token on stderr; `redact.scrub` over that stderr removes it. The
+    # exception TYPE and the frames still print; only secret-shaped values in the text are
+    # replaced. If scrubbing itself fails, fall back to the default hook so the traceback is
+    # never hidden.
+    try:
+        import traceback
+        import redact
+        text = "".join(traceback.format_exception(kind, value, tb))
+        sys.stderr.write(redact.scrub(text))
+        sys.stderr.flush()
+    except Exception:
+        _previous(kind, value, tb)
 
 
 def _flush_or_let_go():
@@ -307,6 +321,11 @@ def _harden_git_config():
         ("uploadpack.packObjectsHook", _REFUSE),
         ("sequence.editor", "true"),
         ("gpg.program", "true"),
+        # 🐛 [2026-10-06] (R8 acc4, 2026-10-06) Every reader here decodes git's output as UTF-8, and
+        # git re-encodes commit messages into `i18n.logOutputEncoding`: with a legacy Thai code page
+        # (ISO-8859-11) set, chamnan-impact's "last change" line printed a Thai subject as mojibake,
+        # and with UTF-16 as NUL-ridden text. VS Code forces the same key per call. Check 431.
+        ("i18n.logOutputEncoding", "UTF-8"),
     )
     try:
         start = int(os.environ.get("GIT_CONFIG_COUNT", "0") or 0)
@@ -686,6 +705,36 @@ def is_store_index(path):
     return pathlib.Path(path).name.lower() in ("readme.md", "index.md")
 
 
+_SYNC_CONFLICT_SHAPES = (
+    re.compile(r"^(?P<base>.+) (?:[2-9]|[1-9][0-9])$"),                       # iCloud / macOS copy
+    re.compile(r"^(?P<base>.+) \((?=[^)]*conflicted copy)[^)]*\)$", re.I),   # Dropbox
+    re.compile(r"^(?P<base>.+) \([0-9]+\)$"),                                # Google Drive
+    re.compile(r"^(?P<base>.+)\.sync-conflict-[0-9]{8}-[0-9]{6}(?:-[A-Za-z0-9]+)?$"),  # Syncthing
+)
+
+
+def is_sync_conflict_copy(path):
+    """True when `path` is a sync client's conflict copy of a sibling file that exists.
+
+    🐛 [2026-10-01] (R283 acc2, 2026-10-01) Sync clients leave copies beside the real file. In a
+    workspace holding `memory/rules/friday.md` and `friday (conflicted copy 2026-10-01).md`, plus
+    `memory/lessons/zebra.md` and `zebra 2.md`, the SessionStart block injected the CONFLICTED
+    copy and called the real file its duplicate, listed `zebra 2.md` as a second lesson, and
+    chamnan-recall returned the copy first; chamnan-doctor said nothing. The name alone is not
+    enough -- the twin must exist, so a user's own `phase 2.md` with no `phase.md` stays a note.
+    Never raises: any OSError reads as "not a copy".
+    """
+    try:
+        p = pathlib.Path(path)
+        for shape in _SYNC_CONFLICT_SHAPES:
+            m = shape.match(p.stem)
+            if m and (p.parent / (m.group("base") + p.suffix)).is_file():
+                return True
+    except (OSError, ValueError):
+        return False
+    return False
+
+
 VCS_MARKERS = (".git", ".hg", ".svn")
 
 
@@ -754,7 +803,8 @@ def store_entries(directory_, root):
     if not directory_.is_dir():
         return []
     return sorted(p for p in directory_.glob("*.md")
-                  if p.is_file() and not is_store_index(p) and inside(p, root))
+                  if p.is_file() and not is_store_index(p) and not is_sync_conflict_copy(p)
+                  and inside(p, root))
 
 
 def find_root(start=None):
@@ -1408,6 +1458,36 @@ def _own_process_started():
     if not _OWN_PROCESS_STARTED:
         _OWN_PROCESS_STARTED.append(_process_started(os.getpid()))
     return _OWN_PROCESS_STARTED[0]
+
+
+# This machine's name, cached like `_OWN_PROCESS_STARTED`: it is written into every lock so a
+# waiter on a different host can tell the PID in it cannot be checked locally.
+_OWN_HOST = []
+
+
+def _own_host():
+    """This machine's host name, computed once; "" when it cannot be determined."""
+    if not _OWN_HOST:
+        try:
+            # Not `os.uname()`: the suite refuses any shipped reference to an API Windows does not
+            # have, guarded or not.
+            # 🐛 [2026-10-06] (1.35.0 release CI) And not `platform.node()` on Windows: it runs the
+            # whole `platform.uname()`, which under Python 3.12+ is a WMI query, and the first call
+            # happened inside the lock window below. Sixty concurrent hooks on the Windows 3.13
+            # runner lost 5 scratch.jsonl entries to LOCK_TIMEOUT; 3.8, which reads the version
+            # without WMI, passed. `socket` would answer cheaply and is refused here: nothing this
+            # package ships imports a network module. Windows keeps its name in COMPUTERNAME;
+            # elsewhere `platform.node()` is `os.uname()` underneath and cheap.
+            if os.name == "nt":
+                name = os.environ.get("COMPUTERNAME", "")
+            else:
+                import platform
+                name = platform.node()
+            name = str(name).replace("\r", "").replace("\n", "").strip()
+        except Exception:
+            name = ""
+        _OWN_HOST.append(name)
+    return _OWN_HOST[0]
 
 
 # 🎯 [owner, 2026-09-23] A plugin other people install has to clean up after itself, safely, and the
@@ -2105,6 +2185,24 @@ def _newer_version_has_been_here(root):
         return False
 
 
+_NOT_CHAMNANS_WARNED = set()
+
+
+def _near_config_key(key):
+    """True when `key` is a near-miss spelling of a real config key (the typo path keeps those)."""
+    import difflib
+    return bool(difflib.get_close_matches(str(key), list(DEFAULT_CONFIG), n=1, cutoff=CONFIG_TYPO_CUTOFF))
+
+
+def _warn_config_not_chamnans(path):
+    key = str(path)
+    if key in _NOT_CHAMNANS_WARNED:
+        return
+    _NOT_CHAMNANS_WARNED.add(key)
+    print(f"chamnan: {path} is not a chamnan config (none of its keys are chamnan's), so it was "
+          f"left as it is and defaults are in use.", file=sys.stderr)
+
+
 def ensure(root=None):
     ws = workspace(root)
     # 🐛 `chamnan-map --preview`'s own --help says it "writes nothing", and in a repository that had
@@ -2196,6 +2294,19 @@ def ensure(root=None):
             current = None
         if not isinstance(current, dict):
             current = {}
+        # 🐛 [2026-10-03] (R12 acc5, 2026-10-03) The merge below keeps only keys that are in
+        # DEFAULT_CONFIG, so a config.json that is not chamnan's at all was rewritten as chamnan's
+        # defaults. Reproduced: a repository whose `.chamnan` is a symlink to a directory outside
+        # it already holding `{"auths": {"keep": "me"}}` (the shape of Docker's config); the
+        # SessionStart hook, which needs no user action, replaced that file with the default
+        # config and every foreign key was gone. A non-empty object sharing no key with
+        # DEFAULT_CONFIG -- not even a near-miss typo of one -- is somebody else's file: it is left
+        # byte-for-byte as it is and the run goes on defaults. `{}` is not covered: it is a chamnan
+        # config being created, and keeps today's behaviour.
+        if current and not any(
+                k in DEFAULT_CONFIG or _near_config_key(k) for k in current):
+            _warn_config_not_chamnans(cfg)
+            return None
         merged = dict(DEFAULT_CONFIG)
         # Keys the user set are kept; keys no longer in DEFAULT_CONFIG are dropped, so a stale
         # option cannot sit in the file looking as though it still does something.
@@ -2813,6 +2924,9 @@ IGNORE_LINES = [
     "logs/nudge_state.json",
     "logs/pointer_seen*.json",
     "logs/repeat_digest.json",
+    "# Derived: mapper.scrub_map_text keeps each scrubbed MAP.md section here so an edit re-scrubs",
+    "# only what changed. As large as the map, and rebuilt on any miss.",
+    "logs/map_scrub_cache.json",
     "",
     "# chamnan: mutex files. `exclusive()` creates `<target>.lock` beside whatever it is guarding",
     "# and unlinks it on the way out; one left behind is a crash, not a record, and is reclaimed",
@@ -3377,6 +3491,8 @@ def _lock_holder_state(lock):
         follows from two values that are both present and disagree. A false ALIVE costs waiting;
         a false DEAD unlinks a live holder's lock and hands the file to two writers at once, which
         is strictly worse than the bug this exists to fix.
+      - PID on another host (third line differs from ours) -> UNKNOWN: its PID cannot be checked
+        here, so only the age rule at LOCK_STALE may break it.
     """
     try:
         lines = lock.read_text(encoding="utf-8", errors="replace").strip().splitlines()
@@ -3385,6 +3501,10 @@ def _lock_holder_state(lock):
     if not lines or not lines[0].strip().isdigit():
         return LOCK_HOLDER_UNKNOWN
     pid = int(lines[0].strip())
+    recorded_host = lines[2].strip() if len(lines) > 2 else ""
+    # Host names are case-insensitive, and COMPUTERNAME is upper case where the DNS name may not be.
+    if recorded_host and _own_host() and recorded_host.lower() != _own_host().lower():
+        return LOCK_HOLDER_UNKNOWN
     if not _pid_is_alive(pid):
         return LOCK_HOLDER_DEAD
     recorded_start = lines[1].strip() if len(lines) > 1 else ""
@@ -3419,6 +3539,10 @@ def exclusive(path):
     # What the lock looked like last time we were refused. A change in it means somebody finished
     # and somebody else started -- the queue is moving, and this waiter's turn is coming.
     seen = None
+    # Built before the lock exists, so the window between creating the lock and saying whose it is
+    # is one write. Computed inside it, a slow first call (a host-name lookup, a process start time)
+    # left an empty lock in place for its whole duration while every waiter queued behind it.
+    body = f"{os.getpid()}\n{_own_process_started()}\n{_own_host()}\n".encode()
     while True:
         try:
             fd = os.open(str(lock), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
@@ -3434,8 +3558,13 @@ def exclusive(path):
             # is handed to an unrelated live process, and the age rule can never break it. The
             # second line is this process's own birth time, cached in `_own_process_started` so
             # paying for it happens once per process lifetime rather than on every acquire.
+            #
+            # 🐛 [2026-10-01] (R173 acc4, 2026-10-01) A PID only means something on the machine that
+            # wrote it. A workspace shared by two machines (NFS/SMB home, a mounted volume) let a
+            # waiter on another host read a live lock as DEAD after 0.25 s -- the PID does not
+            # exist there -- and break it, so the host goes in the lock as a third line.
             try:
-                os.write(fd, f"{os.getpid()}\n{_own_process_started()}\n".encode())
+                os.write(fd, body)
             except OSError:
                 pass
             break
@@ -3896,6 +4025,17 @@ def _record_swallowed():
         pass
 
 
+def record_swallowed():
+    """Count a failure that a handler is about to swallow, where `chamnan-doctor` reads it.
+
+    Call it as the first statement of an `except Exception:` that makes a whole feature fall
+    silent, so a bug inside the feature shows up as a row in `logs/hook_errors.jsonl` instead of
+    the feature being dead for everyone. Not for exceptions that are expected (a missing file, a
+    malformed payload): those are normal and would only bury the real rows.
+    """
+    _record_swallowed()
+
+
 def version_line():
     """One line naming the build, where it lives, and what interpreter is running it.
 
@@ -4068,6 +4208,22 @@ def git_is_too_old():
     return _GIT_TOO_OLD
 
 
+# The directory git named when it refused a repository for "dubious ownership" (True when it refused
+# without naming one), else None. Kept apart from `_GIT_TOO_OLD`: that one is "upgrade git", this
+# one is "trust this directory", and neither sentence helps the other reader.
+_GIT_REFUSED_OWNERSHIP = None
+
+
+def git_refused_ownership():
+    """The path git named when it refused this repository as "dubious ownership", else None.
+
+    None until one has been seen: this reports evidence already gathered, it does not go looking.
+    `git_can_speak_for` is what sets it, and every caller that needs this answer has been through
+    that function first.
+    """
+    return _GIT_REFUSED_OWNERSHIP
+
+
 def git_is_installed():
     """Whether a `git` executable is on PATH at all. Cached, like `git_owns`.
 
@@ -4203,6 +4359,70 @@ def git_status(root):
     return answer
 
 
+def union_merge_source(root, rel):
+    """Where a `merge=union` attribute reaches `rel`, or None.
+
+    Returns `(attributes_file_relative_to_root, line_number)` of the last line
+    that set `merge=union` for the repository-relative POSIX path `rel`, when
+    that is the final state of the `merge` attribute; None otherwise.
+
+    🐛 [2026-10-05] (R14 acc1, 2026-10-05) Under merge=union git keeps both
+    sides of a changed line with no conflict markers, so
+    `memory.unresolved_conflict` cannot see a merged-in contradiction in
+    STATE.md or a memory entry. chamnan never sets the attribute, but a
+    `*.md merge=union` written for a changelog catches the workspace. Check 417.
+
+    Reads only the .gitattributes files that can apply (root, then each
+    ancestor directory of `rel`, outer first, then .git/info/attributes).
+    No subprocess. Never raises.
+    """
+    try:
+        import fnmatch
+        base = str(root)
+        parts = [p for p in str(rel).split("/") if p]
+        sources = [""]
+        for i in range(1, len(parts)):
+            sources.append("/".join(parts[:i]))
+        files = []
+        for d in sources:
+            disp = (d + "/.gitattributes") if d else ".gitattributes"
+            files.append((os.path.join(base, *disp.split("/")), disp, d))
+        if os.path.isdir(os.path.join(base, ".git")):
+            files.append((os.path.join(base, ".git", "info", "attributes"),
+                          ".git/info/attributes", ""))
+        hit = None
+        for full, disp, d in files:
+            try:
+                with open(full, encoding="utf-8-sig") as fh:
+                    lines = fh.read().splitlines()
+            except (OSError, UnicodeDecodeError):
+                continue
+            relpath = "/".join(parts[len(d.split("/")) if d else 0:])
+            name = parts[-1] if parts else ""
+            for n, line in enumerate(lines, 1):
+                tokens = line.split()
+                if not tokens or tokens[0].startswith("#"):
+                    continue
+                pat = tokens[0]
+                if "/" not in pat:
+                    ok = fnmatch.fnmatchcase(name, pat)
+                else:
+                    pat = pat.lstrip("/")
+                    ok = fnmatch.fnmatchcase(relpath, pat)
+                    if not ok and pat.endswith("/**"):
+                        ok = relpath.startswith(pat[:-2])
+                if not ok:
+                    continue
+                for attr in tokens[1:]:
+                    if attr == "merge=union":
+                        hit = (disp, n)
+                    elif attr in ("merge", "-merge", "!merge") or attr.startswith("merge="):
+                        hit = None
+        return hit
+    except Exception:
+        return None
+
+
 def git_folds_case(root):
     """git's own `core.ignorecase` for `root`. False when git cannot answer.
 
@@ -4299,6 +4519,41 @@ def workspace_is_tracked(root):
     return out.returncode == 0 and bool(out.stdout.strip())
 
 
+def is_sparse(root):
+    """True when `root` is a sparse checkout, read from files in the git dir and never from git.
+
+    It reads files because the suite pins the number of git call sites, and the answer is on disk
+    anyway: `info/sparse-checkout` lists the patterns. That file is left behind by `git
+    sparse-checkout disable`, so it alone proves nothing and `core.sparseCheckout = true` in the
+    common config (or `config.worktree` of a linked worktree) must agree. Any error counts as not
+    sparse.
+    """
+    try:
+        dot_git = Path(root) / ".git"
+        if dot_git.is_file():
+            target = dot_git.read_text(encoding="utf-8", errors="replace").strip()
+            if not target.startswith("gitdir:"):
+                return False
+            gitdir = Path(target[len("gitdir:"):].strip())
+            if not gitdir.is_absolute():
+                gitdir = Path(root) / gitdir
+        else:
+            gitdir = dot_git
+        common = gitdir
+        marker = gitdir / "commondir"
+        if marker.is_file():
+            common = gitdir / marker.read_text(encoding="utf-8", errors="replace").strip()
+        if not (gitdir / "info" / "sparse-checkout").is_file():
+            return False
+        pattern = re.compile(r"(?im)^\s*sparsecheckout\s*=\s*true\s*$")
+        for cfg in (common / "config", gitdir / "config.worktree"):
+            if cfg.is_file() and pattern.search(cfg.read_text(encoding="utf-8", errors="replace")):
+                return True
+        return False
+    except (OSError, ValueError):
+        return False
+
+
 def git_can_speak_for(root):
     """True when git recognises `root` as part of a repository — the weaker question `git_owns` is
     not, and the right one for every READ that is path-scoped to `root`.
@@ -4339,6 +4594,13 @@ def git_can_speak_for(root):
         if out.returncode != 0 and "unknown option" in (out.stderr or "").lower():
             global _GIT_TOO_OLD
             _GIT_TOO_OLD = True
+        # 🐛 [2026-10-01] (R322 acc2, 2026-10-01) git refuses a repository owned by another user
+        # (containers, bind mounts, CI) and exits non-zero, which read as "not a repository" and
+        # silenced every git-based line with no explanation. Same stderr, same probe, no new call.
+        if out.returncode != 0 and "dubious ownership" in (out.stderr or "").lower():
+            global _GIT_REFUSED_OWNERSHIP
+            named = re.search(r"repository at '([^']+)'", out.stderr or "")
+            _GIT_REFUSED_OWNERSHIP = named.group(1) if named else str(root)
         answer = out.returncode == 0 and bool(out.stdout.strip())
         toplevel = out.stdout.strip() if answer else None
         if not answer:

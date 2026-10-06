@@ -65,6 +65,15 @@ def fenced_lines(text):
 #   Bidi embeddings, overrides and isolates (U+202A-202E, U+2066-2069) -- reorder the rendered text
 #     against the stored bytes. The Trojan Source class, CVE-2021-42574.
 #   ZWSP and BOM (U+200B, U+FEFF) -- invisible, and split a word into two that no search matches.
+#   Tag characters (U+E0000-E007F), word joiner and invisible operators (U+2060-2064), deprecated
+#     format characters (U+206A-206F), interlinear annotation (U+FFF9-FFFB) and the variation
+#     selectors supplement (U+E0100-E01EF) -- invisible, with no role in a one-line label. Tag
+#     characters are the "ASCII smuggling" channel: text a person cannot see but a model reads.
+#     # 🐛 [2026-10-01] (R371 acc5, 2026-10-01) Measured: `one_line` of 'ok' + tag-encoded
+#     'IGNORE' + ... kept all six tag characters and U+2060.
+#     The set now matches `redact._TERMINAL_SAFE` except U+FE00-FE0F, which stays: it is the emoji
+#     presentation selector (`whole_graphemes` and ordinary emoji depend on it). The cost, accepted:
+#     a subdivision flag such as England's loses its tags and shows as a plain black flag.
 #
 # What is deliberately NOT on the list, and this is the load-bearing half: ZWJ (U+200D), ZWNJ
 # (U+200C) and the directional MARKS (U+200E/200F). ZWJ and ZWNJ are letters-shaping characters --
@@ -96,7 +105,12 @@ _CONTROLS = str.maketrans(
         + [chr(i) for i in range(0x80, 0xA0) if chr(i) != "\x85"]
         + [chr(i) for i in range(0x202A, 0x202F)]
         + [chr(i) for i in range(0x2066, 0x206A)]
-        + ["\u200b", "\ufeff"]}})
+        + ["\u200b", "\ufeff"]
+        + [chr(i) for i in range(0x2060, 0x2065)]
+        + [chr(i) for i in range(0x206A, 0x2070)]
+        + [chr(i) for i in range(0xFFF9, 0xFFFC)]
+        + [chr(i) for i in range(0xE0000, 0xE0080)]
+        + [chr(i) for i in range(0xE0100, 0xE01F0)]}})
 
 
 # 🐛 [2026-09-07] `# ` and `[ \t]+` are ASCII, and a CJK keyboard types U+3000 IDEOGRAPHIC SPACE
@@ -226,6 +240,26 @@ def as_quoted(value, limit=80):
     return text if len(text) <= limit else whole_graphemes(text[:limit - 1]) + "…"
 
 
+# A directory heading must name a path a reader can open. At the 80-character default it cut
+# `src/main/java/...` mid-name and dropped the rest, so every file below it read as missing.
+QUICK_INDEX_DIR_CHARS = 400
+
+
+def quick_index_path(rel):
+    """The exact path string the Quick Index parse reconstructs for root-relative posix path `rel`.
+
+    One source of truth shared by the mapper (which writes the heading and row) and the
+    session-start hook (which compares the parsed names with the disk), so the two cannot disagree
+    about control-character folding or clipping again.
+    """
+    import posixpath
+    folder, name = posixpath.dirname(rel), posixpath.basename(rel)
+    f = as_quoted(folder or ".", QUICK_INDEX_DIR_CHARS).strip("/")
+    f = "" if f in (".", "") else f
+    n = as_quoted(name)
+    return f"{f}/{n}" if f else n
+
+
 # The per-item ceiling on repository-authored FREE TEXT that is injected into every session.
 #
 # 120 because `memory.MAX_TITLE_CHARS` had already picked it for exactly this hazard and had the
@@ -349,6 +383,10 @@ def names_the_path(declared, target):
     target = str(target).strip().strip("`").lstrip("./")
     if not declared or not target:
         return False
+    # 🐛 [2026-10-06] (R32 acc5, 2026-10-06) A lesson written about `café.py` in one Unicode form
+    # never joined a query in the other, the same miss `impact.lookup` had. Check 437.
+    declared = unicodedata.normalize("NFC", declared)
+    target = unicodedata.normalize("NFC", target)
     return declared == target or declared.endswith("/" + target)
 
 

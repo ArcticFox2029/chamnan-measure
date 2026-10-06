@@ -21,6 +21,7 @@ time it did without it.
 import os
 import fnmatch
 import re
+import unicodedata
 
 from unicode_marks import mark_aware
 import sys
@@ -197,10 +198,12 @@ def _index(files):
     by_noext, noext_count, stem_count, by_stem = {}, {}, {}, {}
     for f in files:
         p = f["path"]
-        noext = p.rsplit(".", 1)[0]
+        # Keys are the NFC form; the value stored below stays the real on-disk path `p`.
+        nfc = unicodedata.normalize("NFC", p)
+        noext = nfc.rsplit(".", 1)[0]
         noext_count[noext] = noext_count.get(noext, 0) + 1
         by_noext[noext] = p
-        stem = Path(p).stem
+        stem = Path(nfc).stem
         stem_count[stem] = stem_count.get(stem, 0) + 1
         by_stem[stem] = p
     by_noext = {n: p for n, p in by_noext.items() if noext_count[n] == 1}
@@ -226,6 +229,12 @@ def resolve(name, importer, by_noext, by_stem, by_last_segment=None, roots=None)
     """
     if not name:
         return None
+    # 🐛 [2026-10-05] (R55 acc1, 2026-10-05) macOS tools can write a file name in NFD while the
+    # source writes the import in NFC (and Python NFKC-normalises identifiers), so an NFD-named
+    # module lost its used-by edge. Keys and names are compared in NFC; returned paths stay real.
+    # Check 415.
+    name = unicodedata.normalize("NFC", name)
+    importer = unicodedata.normalize("NFC", importer)
 
     # Relative paths, as JS, C, Ruby and Dart write them.
     if name.startswith((".", "/")) or "/" in name:
@@ -635,7 +644,16 @@ def lookup(text, target):
         return None, None
     if target in parsed:
         return target, parsed[target]
-    matches = [p for p in parsed if p.endswith("/" + target)]
+    # 🐛 [2026-10-06] (R32 acc5, 2026-10-06) APFS keeps a name in the form it was created in, so a
+    # file created decomposed (NFD) is mapped that way while git, the keyboard and most tools hand
+    # over the composed (NFC) spelling, and the question was answered "nothing recorded". Both sides
+    # are compared in NFC; the answer is the map's own spelling, which is the one that opens the
+    # file. Check 437.
+    nfc = unicodedata.normalize("NFC", target)
+    by_nfc = {unicodedata.normalize("NFC", p): p for p in parsed}
+    if nfc in by_nfc:
+        return by_nfc[nfc], parsed[by_nfc[nfc]]
+    matches = [p for n, p in by_nfc.items() if n.endswith("/" + nfc)]
     if len(matches) == 1:
         return matches[0], parsed[matches[0]]
     return None, None

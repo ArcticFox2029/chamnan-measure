@@ -23,6 +23,7 @@ import calendar
 import datetime
 import subprocess
 import re
+import shlex
 import mdblock
 import tokens
 from pathlib import Path
@@ -130,7 +131,8 @@ def records(root):
     # session record is read by the SessionStart hook with no user action at all, so a planted link
     # put a file's title and structure into every session's block automatically.
     return sorted((p for p in d.glob("*.md")
-                   if p.is_file() and not ws.is_store_index(p) and ws.inside(p, root)),
+                   if p.is_file() and not ws.is_store_index(p)
+                   and not ws.is_sync_conflict_copy(p) and ws.inside(p, root)),
                   key=_key, reverse=True)
 
 
@@ -225,6 +227,14 @@ def where_git_says_you_stopped(root, limit=6, name_files=True, status=None):
                     "is too old for `git -C`, which arrived in git 1.8.5 (2013) and is what every "
                     "query here uses. Upgrading git restores this section; everything else in this "
                     "block already works without it.")
+        if ws.git_refused_ownership():
+            # 🐛 [2026-10-01] (R322 acc2, 2026-10-01) Said nothing before: "dubious ownership" read
+            # as "not a repository", and every git-based line vanished without a reason.
+            _path = mdblock.as_quoted(str(ws.git_refused_ownership()), 200)
+            return ("**Where the last session stopped** — not available: git refuses this "
+                    "repository because it is owned by another user (git calls it \"dubious "
+                    "ownership\"); every git-based line in this block is off until it is trusted. "
+                    f"If you trust it: `git config --global --add safe.directory {shlex.quote(_path)}`.")
         # 🐛 [2026-09-06] Without this, a directory holding a `.git` git itself refuses -- an
         # interrupted `git init`, a copied-without-contents `.git` -- made every call below walk up
         # and answer about the nearest REAL repository above it. Reproduced: this section reported
@@ -476,7 +486,8 @@ def _is_nothing(body):
 
 def _candidates(d):
     """Every file `prune` is allowed to consider. One definition, because two would drift."""
-    return [q for q in d.glob("*.md") if q.is_file() and not ws.is_store_index(q)]
+    return [q for q in d.glob("*.md") if q.is_file() and not ws.is_store_index(q)
+            and not ws.is_sync_conflict_copy(q)]
 
 
 def _age(path):
