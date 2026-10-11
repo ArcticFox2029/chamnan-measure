@@ -584,6 +584,9 @@ DEFAULT_CONFIG = {
     # file. A notice, never a block — the one time someone genuinely needs to read package-lock.json
     # is the one time refusing would be most wrong.
     "warn_on_bulk_reads": True,
+    # Refuse the agent's own Read, Grep or shell read of a credential file (.env, kubeconfig, a
+    # private key) before it runs, so the value never reaches the model. lib/vault.py.
+    "guard_credential_reads": True,
     # When a file is opened, name what this repository already records about it — the decision, the
     # lesson, the procedure, and who depends on it. The same knowledge `chamnan-impact` answers on
     # demand, arriving without being asked, because the caller is a model and remembering to ask is
@@ -954,6 +957,27 @@ def ceiling_env_status(raw):
     return f"ignored — above the ceiling's bound of {cap}"
 
 
+# 🐛 [2026-10-08] (R4 acc4, 2026-10-08) Every default a release has since replaced, per key.
+# `ensure()` writes the whole DEFAULT_CONFIG into config.json on first run, so a workspace holds
+# every default as if the user had chosen it -- and a later release that changes one never reaches
+# it. Reproduced: 9,000 -> 9,500 for `output_byte_ceiling` (eb947de, 2026-09-15) left this
+# repository's own plugin checkout at 9,000 three weeks on, while a fresh workspace got 9,500. A
+# value equal to a past default is read as "never chosen" and follows the current one; the one
+# user who typed exactly the old number by hand is indistinguishable, and pays by moving with the
+# release. Check 475 derives these from the release tags, so a default changed without being
+# listed here fails the gate rather than stranding every existing workspace.
+PAST_DEFAULTS = {
+    "output_byte_ceiling": (9000,),
+}
+
+
+def _current_default_if_past(key, value):
+    """`value`, or the current default when `value` is one a release has since replaced."""
+    if value in PAST_DEFAULTS.get(key, ()) and type(value) is type(DEFAULT_CONFIG[key]):
+        return DEFAULT_CONFIG[key]
+    return value
+
+
 def _in_range(key, value):
     """False for a value whose TYPE is right and whose meaning is not."""
     if key in _NON_NEGATIVE and isinstance(value, int) and not isinstance(value, bool):
@@ -1034,7 +1058,7 @@ def load_config(root=None):
         # disk is older than it. Reproduced: a log and a session record written one second earlier,
         # both deleted. Session records are committed work.
         if isinstance(v, want) and _in_range(k, v):
-            cfg[k] = v
+            cfg[k] = _current_default_if_past(k, v)
     _CONFIG_MEMO[stamp] = dict(cfg)
     return cfg
 
@@ -1133,6 +1157,33 @@ def jsonl_lines(text, keepends=False):
     # already normalised that away, so this is a no-op there and a fix only where it is needed.
     parts = [p[:-1] if p.endswith("\r") else p for p in parts]
     return [p + "\n" for p in parts] if keepends else parts
+
+
+# 🐛 [2026-10-07] (R101 acc5, 2026-10-07: a Python security release changed a default) Since
+# Python 3.11 (and 3.10.7, 3.9.14, 3.8.14), converting an integer of more than 4,300 digits raises
+# a plain ValueError, so `json.loads` on a JSON file holding one fails -- not with JSONDecodeError,
+# which is what most callers catch. Measured on 3.12: a package.json with one such number lost all
+# its commands (`npm test`, `npm run build` -> nothing) while 3.9 listed both. Repository files are
+# parsed through this instead: a number too long to convert is kept as its text, which no caller
+# uses as a number, and nothing pays the quadratic conversion the limit exists to stop. Check 467.
+_MAX_INT_DIGITS = 4000
+
+
+def _int_or_text(digits):
+    return int(digits) if len(digits) <= _MAX_INT_DIGITS else digits
+
+
+def loads_repository_json(text):
+    """`json.loads` for a file from the repository, which may hold a number of any length.
+
+    A document nested past the recursion limit raises RecursionError, which a caller catching only
+    JSONDecodeError would miss; it is reported as what it is to the caller -- not a document this
+    can read -- by raising JSONDecodeError instead.
+    """
+    try:
+        return json.loads(text, parse_int=_int_or_text)
+    except RecursionError:
+        raise json.JSONDecodeError("nested past the recursion limit", str(text)[:80], 0) from None
 
 
 def append_jsonl(root, rel, row, keep):
@@ -1488,7 +1539,7 @@ def _own_host():
         try:
             # Not `os.uname()`: the suite refuses any shipped reference to an API Windows does not
             # have, guarded or not.
-            # 🐛 [2026-10-06] (1.35.0 release CI) And not `platform.node()` on Windows: it runs the
+            # 🐛 [2026-10-06] (self-measured) Found by the 1.35.0 release CI. And not `platform.node()` on Windows: it runs the
             # whole `platform.uname()`, which under Python 3.12+ is a WMI query, and the first call
             # happened inside the lock window below. Sixty concurrent hooks on the Windows 3.13
             # runner lost 5 scratch.jsonl entries to LOCK_TIMEOUT; 3.8, which reads the version
@@ -1823,7 +1874,118 @@ def read_hook_payload(stream=None):
         print("chamnan: this is a hook -- it reads one JSON event on stdin from the host. "
               "To try it by hand: echo '{\"cwd\": \".\"}' | python3 <hook>", file=sys.stderr)
         return {}
-    return _json.load(stream)
+    # 🐛 [2026-10-09] (R2 acc4, 2026-10-09: a hook blocked reading stdin outlived its declared timeout
+    # for hours when the host left the pipe open) `json.load` waits for end of file, so a host that
+    # wrote the event and kept stdin open held every chamnan hook -- and the tool call behind it --
+    # until something killed it. Measured: all four hooks tried were still waiting after 12 s. The
+    # event is complete as soon as it parses, so the read stops there; a pipe that goes quiet with
+    # nothing parseable is treated as no event. Check 481.
+    try:
+        fd = stream.fileno()
+    except (AttributeError, ValueError, OSError):
+        return _json.load(stream)
+    return _read_one_json_event(fd, _json)
+
+
+# How long a hook waits for more of its event once the pipe has gone quiet. Hosts write the whole
+# event at once, so this is reached only when one never finishes writing.
+HOOK_STDIN_IDLE_SECONDS = 5.0
+
+
+def _parse_at_eof(buf, _json):
+    # End of file: the old behaviour exactly, including raising on a malformed event.
+    return _json.loads(buf.decode("utf-8", "replace") or "{}") if buf.strip() else {}
+
+
+def _could_end_json(buf):
+    # Only a buffer that could end a JSON object is worth parsing; a large event arrives in many
+    # chunks and re-parsing each prefix would be quadratic.
+    return buf.rstrip().endswith((b"}", b"]"))
+
+
+_NOT_A_PIPE = object()
+
+
+def _read_one_json_event_nt(fd, _json):
+    """Windows: the same read, by polling the pipe, so no read is left pending; `_NOT_A_PIPE` otherwise.
+
+    🐛 [2026-10-11] (self-measured) On windows-latest, the thread below leaves a synchronous ReadFile
+    pending on stdin when the host keeps the pipe open. On Windows every later child that inherits
+    stdin then hangs -- `git --version` included, measured with faulthandler on the runner --
+    because I/O on one synchronous pipe is serialised behind that read. chamnan_session_start.py
+    runs git through `coedit`, so it held the session for as long as the pipe stayed open while
+    every other hook exited. PeekNamedPipe asks how much is waiting without reading, so the
+    `os.read` that follows never blocks and nothing is pending when the hook moves on. Check 481.
+    """
+    try:
+        import ctypes
+        import msvcrt
+        from ctypes import wintypes
+        handle = msvcrt.get_osfhandle(fd)
+        peek = ctypes.WinDLL("kernel32", use_last_error=True).PeekNamedPipe
+        peek.argtypes = [wintypes.HANDLE, ctypes.c_void_p, wintypes.DWORD, ctypes.c_void_p,
+                         ctypes.POINTER(wintypes.DWORD), ctypes.c_void_p]
+        peek.restype = wintypes.BOOL
+    except (ImportError, OSError, AttributeError, ValueError):
+        return _NOT_A_PIPE
+    avail, buf, quiet_since, first = wintypes.DWORD(), b"", time.monotonic(), True
+    while True:
+        if not peek(handle, None, 0, None, ctypes.byref(avail), None):
+            # 109 is ERROR_BROKEN_PIPE, the writer's end of file. Anything else on the first ask
+            # means stdin is not a pipe (a file, NUL), which a plain read handles without hanging.
+            if first and ctypes.get_last_error() != 109:
+                return _NOT_A_PIPE
+            return _parse_at_eof(buf, _json)
+        first = False
+        if avail.value:
+            buf += os.read(fd, min(avail.value, 65536))
+            quiet_since = time.monotonic()
+            if _could_end_json(buf):
+                try:
+                    return _json.loads(buf.decode("utf-8", "replace"))
+                except ValueError:
+                    pass
+        elif time.monotonic() - quiet_since > HOOK_STDIN_IDLE_SECONDS:
+            return {}
+        else:
+            time.sleep(0.01)
+
+
+def _read_one_json_event(fd, _json):
+    """The first complete JSON value read from `fd`, without waiting for end of file."""
+    if os.name == "nt":
+        got = _read_one_json_event_nt(fd, _json)
+        if got is not _NOT_A_PIPE:
+            return got
+    import queue
+    import threading
+    chunks = queue.Queue()
+
+    def pump():
+        while True:
+            try:
+                data = os.read(fd, 65536)
+            except OSError:
+                data = b""
+            chunks.put(data)
+            if not data:
+                return
+
+    threading.Thread(target=pump, daemon=True).start()
+    buf = b""
+    while True:
+        try:
+            data = chunks.get(timeout=HOOK_STDIN_IDLE_SECONDS)
+        except queue.Empty:
+            return {}
+        if not data:
+            return _parse_at_eof(buf, _json)
+        buf += data
+        if _could_end_json(buf):
+            try:
+                return _json.loads(buf.decode("utf-8", "replace"))
+            except ValueError:
+                continue
 
 
 def hook_root(payload=None):
@@ -2312,7 +2474,7 @@ def ensure(root=None):
         # option cannot sit in the file looking as though it still does something.
         # Type as well as key. `{"index_token_budget": "three thousand"}` parses, survives the key
         # filter, and then raises TypeError on the first `>` comparison in a different module.
-        good = {k: v for k, v in current.items()
+        good = {k: _current_default_if_past(k, v) for k, v in current.items()
                 if k in DEFAULT_CONFIG and isinstance(v, type(DEFAULT_CONFIG[k]))
                 and _in_range(k, v)}
         merged.update(good)
@@ -3242,6 +3404,18 @@ def _replace_with_retry(tmp, dest, first_pause=0.02, max_pause=0.2, budget=1.0):
 LAST_WRITE_ERROR = []
 
 
+def _enclosing_repository(directory):
+    """The real path of the nearest directory at or above `directory` holding `.git`, or None."""
+    try:
+        here = pathlib.Path(os.path.realpath(str(directory)))
+    except (OSError, ValueError):
+        return None
+    for d in (here, *here.parents):
+        if (d / ".git").exists():
+            return d
+    return None
+
+
 def atomic_write_text(dest, text, encoding="utf-8"):
     """Write `text` to `dest` so a reader sees the old file or the new one, never a half of either.
 
@@ -3273,6 +3447,19 @@ def atomic_write_text(dest, text, encoding="utf-8"):
     tmp = None
     try:
         dest = pathlib.Path(dest)
+        # 🐛 [2026-10-07] (R147 acc4, 2026-10-07: dotfile managers and symlinked configuration) The
+        # rename put a regular file where a SYMLINK had been: `AGENTS.md -> CLAUDE.md`, or a config a
+        # dotfile manager (Stow, chezmoi) links into place, lost its link, and the file the link
+        # pointed at kept the old content. A plain `open(dest, "w")` writes through a link, so the
+        # atomic write does too: it stages and renames beside the file the link lands on -- but only
+        # where the link could not have been planted to point out: inside a repository, its target
+        # must be in the same repository (a committed `.chamnan/STATE.md -> ~/.bashrc` must not turn
+        # a state write into a write to the user's shell profile; it is replaced as before). Check 469.
+        if dest.is_symlink():
+            real = pathlib.Path(os.path.realpath(str(dest)))
+            repo = _enclosing_repository(dest.parent)
+            if repo is None or real == repo or repo in real.parents:
+                dest = real
         # 🐛 An atomic replace does not need write permission on the TARGET — `os.replace` only
         # needs a writable directory — so switching to it silently defeated a read-only file. A
         # user who `chmod 444`s a store means it, and `chamnan-promote` relies on the refusal to
@@ -3462,6 +3649,15 @@ def notice_due(root, key, times=NOTICE_TIMES):
 LOCK_HOLDER_ALIVE, LOCK_HOLDER_DEAD, LOCK_HOLDER_UNKNOWN = "alive", "dead", "unknown"
 
 
+def _lock_fingerprint(lock):
+    """(mtime_ns, size, inode) of the lock file, or None when it is gone."""
+    try:
+        st = lock.stat()
+    except OSError:
+        return None
+    return (st.st_mtime_ns, st.st_size, getattr(st, "st_ino", 0))
+
+
 def _lock_holder_state(lock):
     """"alive", "dead", or "unknown" — and the third is not the same as the second.
 
@@ -3610,14 +3806,18 @@ def exclusive(path):
             # "Dead", not "not alive": a lock is created and its PID written a moment later, so an
             # empty lock is what a healthy holder looks like for a few microseconds. That case
             # stays on the age rule, which is what it was always decided by.
+            #
+            # 🐛 [2026-10-07] (R159 acc4, 2026-10-07: Borg's stale-lock cleanup deleted a live
+            # successor's lock) Two waiters judged the same crashed lock dead; the first unlinked it
+            # and took the lock, and the second then unlinked BY PATH -- the first one's live lock --
+            # and took it too: two writers. The break now removes only the lock it judged, the one
+            # whose stat fingerprint is still `here`. Check 470.
             if age > LOCK_READ_AFTER:
                 try:
                     state = _lock_holder_state(lock)
-                    if state == LOCK_HOLDER_DEAD:
-                        lock.unlink()
-                        continue
-                    if age > LOCK_STALE and state != LOCK_HOLDER_ALIVE:
-                        lock.unlink()
+                    if state == LOCK_HOLDER_DEAD or (age > LOCK_STALE and state != LOCK_HOLDER_ALIVE):
+                        if _lock_fingerprint(lock) == here:
+                            lock.unlink()
                         continue
                 except OSError:
                     pass

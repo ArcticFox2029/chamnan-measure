@@ -50,7 +50,11 @@ KINDS = (
 
 # Where a match is worth more. A term in the title is the document being ABOUT that thing; a term
 # in the body may be an aside.
-FIELD_WEIGHT = {"title": 6.0, "blurb": 3.0, "body": 1.0}
+# 🎯 [2026-10-09] (R8 acc4, 2026-10-09) Was 6/3/1. Known-item queries over five seeds: a query made
+# of body words found its note at MRR 0.834 against 0.912 at 3/2/1, title-word queries lost
+# 0.949 to 0.937, and a mixed query gained 0.904 to 0.922 — a title six times a body word buried
+# the note a person half-remembers by what it said behind every note that only names the word.
+FIELD_WEIGHT = {"title": 3.0, "blurb": 2.0, "body": 1.0}
 
 MAX_BODY_TERMS = 400        # per document, by frequency: the tail of a long skill is noise
 SNIPPET = 90
@@ -81,9 +85,17 @@ def scrubber_id():
     """
     global _SCRUBBER_ID
     if _SCRUBBER_ID is None:
+        # 🐛 [2026-10-11] (R92 acc4, 2026-10-10; R32 acc4, 2026-10-11: Python upgrades replace the
+        # Unicode database) The stored terms are folded too, so a change to this module's folding or
+        # to the interpreter's Unicode version left an index built the old way: a zero-width space
+        # taught to `fold` would not reach notes indexed before it. Both join the fingerprint.
         try:
-            with open(redact.__file__, "rb") as fh:
-                _SCRUBBER_ID = hashlib.sha1(fh.read()).hexdigest()[:12]
+            h = hashlib.sha1()
+            for path in (redact.__file__, __file__):
+                with open(path, "rb") as fh:
+                    h.update(fh.read())
+            h.update(unicodedata.unidata_version.encode())
+            _SCRUBBER_ID = h.hexdigest()[:12]
         except OSError:
             return "unknown"
     return _SCRUBBER_ID
@@ -138,11 +150,18 @@ def _drop_marks(text):
 # folding function now runs on BOTH the stored and the query side. Marks are dropped only after
 # a Latin, Greek or Cyrillic letter; after any other script they are kept, because in Thai a tone
 # mark changes the word (ทำ / ท้า, คำ / ค้า) and stripping it would merge different words.
+# 🐛 [2026-10-11] (R92 acc4, 2026-10-10: a zero-width space is a Thai word-break hint) Text pasted
+# from the web or a Thai editor carries U+200B between words, and NFKC keeps it, so `ค้น\u200bหา` in a
+# note was not `ค้นหา` to a search -- which found nothing and then suggested the same word back.
+# The zero-width characters carry no letter; folding drops them on both sides. Check 507.
+_ZERO_WIDTH = dict.fromkeys(map(ord, "\u200b\u200c\u200d\u2060\ufeff"))
+
+
 def fold(text):
     """NFKC, casefold, then drop accents on Latin/Greek/Cyrillic letters only."""
     if _ASCII_ONLY.match(text):
         return text.lower()
-    return _drop_marks(unicodedata.normalize("NFKC", text).casefold())
+    return _drop_marks(unicodedata.normalize("NFKC", text).casefold()).translate(_ZERO_WIDTH)
 
 
 # An identifier's parts. `_` and `.` split on the word pattern's own boundaries; a camelCase hump
@@ -697,6 +716,58 @@ def _hits(entry, wanted, phrases, idf=None, pidf=None):
             score += FIELD_WEIGHT["body"] * 2 * (pidf.get(p, 1.0) if pidf else 1.0)
             why.append("body")
     return score * float(entry.get("weight", 1.0)), why
+
+
+def closest_stretch(word, texts, cutoff=0.8):
+    """The stretch of `texts` most like `word`, for a did-you-mean in a script written without spaces.
+
+    🐛 [2026-10-09] (R176 acc4, 2026-10-09: 68.87% of students misspelt Thai technical loanwords)
+    Thai is written without spaces, so a title cannot be split into words, and a vowel or tone mark
+    is not a word character, so splitting on `\\w` cut `คอนฟิก` to `คอนฟ`. Windows a little shorter
+    and longer than `word` are compared instead, each starting and ending where the next character
+    is not a combining mark. Only texts sharing half of `word`'s character pairs are windowed, which
+    keeps this to a few titles on a store of a thousand. Check 492.
+    """
+    import difflib
+    pairs = {word[i:i + 2] for i in range(len(word) - 1)}
+    if not pairs:
+        return None
+    best, best_key = None, (0, -len(word) - 4, cutoff)
+    for text in texts:
+        if sum(p in text for p in pairs) < max(2, len(pairs) // 2):
+            continue
+        # 🐛 [2026-10-10] (R181 acc4, 2026-10-09: Thai Character Cluster rules) Cutting only before
+        # a combining mark still split a leading vowel from its consonant (`แค` out of `เพิ่มแคช` gave
+        # `พิ่มแค`, 82 of 270 sampled suggestions). TCC's floor: never cut after a leading vowel
+        # (เ แ โ ใ ไ) or before a following one (ะ า ำ ๅ), which are written apart but read as one.
+        cuts = [i for i in range(len(text) + 1)
+                if (i == len(text) or (not unicodedata.category(text[i]).startswith("M")
+                                       and text[i] not in "\u0e30\u0e32\u0e33\u0e45"))
+                and (i == 0 or text[i - 1] not in "\u0e40\u0e41\u0e42\u0e43\u0e44")]
+        for a in cuts:
+            for b in cuts:
+                if b <= a or abs((b - a) - len(word)) > 3:
+                    continue
+                piece = text[a:b]
+                if not piece.strip() or piece != piece.strip():
+                    continue
+                sm = difflib.SequenceMatcher(None, word, piece)
+                if sm.quick_ratio() < cutoff:
+                    continue
+                ratio = sm.ratio()
+                if ratio < cutoff:
+                    continue
+                # More of the typed word explained first, then the closer spelling: `รีสตาท` should
+                # find `รีสตาร์ท`, not the shorter `รีสตา` that happens to score a higher ratio.
+                # 🐛 [2026-10-11] (R63 acc4, 2026-10-10: Thai loanword spelling variants) On a tie in
+                # characters explained, the ratio still preferred a SHORTER stretch, so `คอนฟิค` got
+                # the fragment `คอนฟิ` over `คอนฟิก`. The stretch nearest the typed length goes first:
+                # over 4,000 sampled one-letter typos in six titles, the exact stretch came back 5-9
+                # more times in 400 on every one of ten seeds. Check 500.
+                key = (sum(m.size for m in sm.get_matching_blocks()), -abs(len(piece) - len(word)), ratio)
+                if key > best_key:
+                    best, best_key = piece, key
+    return best
 
 
 def query(index, words, limit=6):

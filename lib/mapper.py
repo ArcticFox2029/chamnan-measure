@@ -173,7 +173,8 @@ _TRACKED_AMBIGUOUS = {}
 _GENERATED_GLOBS = {}
 SKIPPED_GENERATED = set()
 SKIPPED_AI_IGNORED = set()
-_AI_IGNORE_FILES = (".aiignore", ".cursorignore", ".codeiumignore", ".aiexclude")
+_AI_IGNORE_FILES = (".aiignore", ".cursorignore", ".codeiumignore", ".aiexclude", ".geminiignore",
+                    ".claudeignore")
 _AI_IGNORE_PATTERNS = {}
 
 
@@ -182,6 +183,9 @@ _AI_IGNORE_PATTERNS = {}
 # summary into `.chamnan/MAP.md`, which is injected into every session. Users keep these files so AI
 # tools stay away from a path, and chamnan read none of them. Four names, gitignore syntax, at the
 # repository root only: `.aiignore`, `.cursorignore`, `.codeiumignore`, `.aiexclude`.
+# 🐛 [2026-10-09] (R160 acc5, 2026-10-09) `.geminiignore`, which Gemini CLI documents, and
+# `.claudeignore`, which Claude Code users write although Claude Code does not read it, state the
+# same intent; a path named only in either had its first comment injected. Check 491.
 def _ai_ignore_patterns(root):
     """`(negated, pattern)` pairs from the AI-exclusion files at `root`, in file order."""
     key = str(root)
@@ -1389,7 +1393,7 @@ REGEX_RULES = {
         ("func", r"^(?:export\s+)?(?:const|let)\s+(\w+)\s*=\s*(?:async\s*)?\(([^()]*)\)\s*(?::[^=]*?)?=>"),
         ("func", r"^\s{2,}(?:public\s+|private\s+|protected\s+|static\s+|readonly\s+)*"
                  r"(?:async\s+)?(?!if|for|while|switch|catch|return|constructor\b)"
-                 r"(\w+)\s*\(([^)]*)\)\s*(?::\s*[\w<>\[\], |]+\s*)?\{"),
+                 r"(\w+)\s*\(([^)]*)\)\s*(?::\s*[\w<>\[\],|](?:[\w<>\[\], |]*[\w<>\[\],|])?\s*)?\{"),
         ("class", r"^(?:export\s+)?(?:default\s+)?(?:abstract\s+)?class\s+(\w+)"),
         # `.ts` shares this rule set, and TypeScript's declarations are mostly neither functions
         # nor classes. A real 4,133-line `.d.ts` declaring 91 exported interfaces and type aliases
@@ -1501,7 +1505,11 @@ REGEX_RULES = {
         ("class", r"^\s*(?:public\s+)?(?:final\s+)?(?:class|struct|enum|protocol|extension)\s+(\w+)"),
     ],
     "dart": [
-        ("func", r"^\s*(?:[\w<>,\?\[\] ]+\s+)?(\w+)\s*\(([^)]*)\)\s*(?:async\s*)?\{"),
+        # 🐛 [2026-10-11] (R73 acc4, 2026-10-10) This return type, and the return annotation of the
+        # JavaScript member rule, could start or end on a space, so the whitespace around them had
+        # several owners: a line of 2,000 spaces cost 30 s here and `  0():` before them 22 s there.
+        # Both start and end on a non-space now. Check 504.
+        ("func", r"^\s*(?:[\w<>,\?\[\]](?:[\w<>,\?\[\] ]*[\w<>,\?\[\]])?\s+)?(\w+)\s*\(([^)]*)\)\s*(?:async\s*)?\{"),
         ("class", r"^\s*(?:abstract\s+)?(?:class|mixin|enum|extension)\s+(\w+)"),
     ],
     "lua": [("func", r"^\s*(?:local\s+)?function\s+([\w.:]+)\s*\(([^)]*)\)")],
@@ -1717,7 +1725,7 @@ def _notebook_source(source):
     than another language's code read as Python.
     """
     try:
-        nb = json.loads(source)
+        nb = ws.loads_repository_json(source)
     except (ValueError, RecursionError):
         return ""
     if not isinstance(nb, dict) or not isinstance(nb.get("cells"), list):
